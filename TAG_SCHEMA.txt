@@ -1,0 +1,61 @@
+Output tag vocabulary
+============================================================================
+TAG    PARENT     MEANING
+----------------------------------------------------------------------------
+<doc>  root       Wraps the entire generated document.
+<meta> doc        Document-level metadata block.
+<title>meta       Document title. Plain text, no '#' marker.
+<topic>meta       One-line statement of the subject matter.
+<src>  meta       Provenance: source filename, figure count, model, timestamp.
+<obj>  doc        Learning objectives.
+<goal> obj        One learning objective. One per element, no bullet marker.
+<sec>  doc        One section. Attributes: id, level.
+<head> sec        Section heading. Plain text; depth lives in sec/@level.
+<con>  sec        Narrative content prose. May occur several times per section when figures are interleaved into the flow.
+<fig>  sec / doc  A figure. Attribute: id. Always contains the literal [FIGURE:id] marker from the source, plus <cap> and <desc>.
+<cap>  fig        Short one-sentence caption for the figure.
+<desc> fig        Figure description, restricted to what a sighted reader would lose without the image: layout, colour, arrow direction, what is labelled where. Claims that stay true with the figure deleted are moved into <con>.
+<key>  sec        Key points for the section.
+<pt>   key        One key point. One per element, no bullet marker.
+<def>  sec        Terms introduced by the section.
+<term> def        One definition, phrased as a complete sentence that begins with the term (e.g. 'Thyroglobulin is a ...').
+<clin> sec        Clinical relevance or correlation note.
+<tbl>  sec        A table carried over or reconstructed from the source.
+<note> sec        Aside, caveat, or a machine-readable generation warning (attribute status="failed") when a section could not be written.
+<sum>  doc        Closing synthesis of the whole document.
+<ref>  doc        Reference list.
+<cit>  ref        A single citation.
+
+Markdown syntax policy
+----------------------
+The tags carry the document structure, so structural markdown is not emitted:
+  * <title> and <head> hold plain text -- no '#' or '##' markers. Heading depth
+    is expressed by the level attribute on <sec>.
+  * List items are elements (<goal>, <pt>, <term>, <cit>), not '- ' bullets.
+  * Inline emphasis (**bold**, *italic*) is stripped from generated text by
+    default. Pass --keep-emphasis to retain it.
+Prose style
+-----------
+Generated prose is held to a fixed style contract, enforced by prompt and then
+checked by a deterministic linter with an optional repair pass:
+  * every sentence names its own subject (no leading "It/They/These/This/Such",
+    no backward-pointing "its"/"their");
+  * quantity words stay welded to their substance ("iodine deficiency", never
+    "a deficiency in dietary iodine");
+  * causation is a verb and the cause is the subject ("Graves' disease causes
+    hyperthyroidism", never "is a frequent cause of");
+  * enumerations repeat the head noun ("type 1 deiodinase and type 2
+    deiodinase");
+  * an abbreviation is fixed once as "thyroxine (T4)" and then never alternates.
+
+Content-level markdown INSIDE <con> is preserved: if a section body genuinely
+needs a short list or a table, that stays as markdown, because it is part of the
+content rather than part of the document skeleton. The literal [FIGURE:id]
+markers are likewise never touched.
+
+Figure blocks always look like:
+    <fig id="p5_b2">
+    [FIGURE:p5_b2]
+    <cap>...</cap>
+    <desc>...</desc>
+    </fig>
