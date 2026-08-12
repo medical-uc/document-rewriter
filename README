@@ -1,19 +1,35 @@
 Rewrite Medical Markdown Files
 
-This is a simple script that rewrites a messy medical school material that was
-directly converted from PDF slides into a `.md` files. The output files are
-formatted specifically for use by the pipeline listed in
+This is a script that turns medical textbook chapters, imperfectly converted
+from PDF, into tagged `.md` study documents. The output files are formatted
+specifically for use by the pipeline listed in
 
   https://github.com/medical-uc/knowledge-graph-pipeline
 
-This pipeline defaults to an LLM back-end hosted on
+A textbook chapter is already finished prose, so the script does not rewrite
+it. Every content paragraph in the source is carried over verbatim into a
+`<con>`, with only the mechanical repairs the PDF extractor makes necessary:
+non-breaking spaces and stand-in soft hyphens are normalised, and paragraphs
+split mid-sentence at a page break are rejoined. Figures and tables are
+emitted at the position they held in the source, and mentions of them in the
+prose become inline `<figref>` and `<tblref>` references.
+
+Inference is confined to the document metadata, which the source has no
+counterpart for. In practice that is a single call for `<topic>`, plus a
+caption for the occasional unnumbered inline diagram. Everything else, the
+title, objectives, summary, glossary and reading list, comes from the chapter
+itself. Because so little is inferred, `--offline` produces a complete and
+correct document with no back end at all.
+
+When it is used, the back end is hosted on
 
   http://jupyter-02.aml1.id.iosda.org:8888
 
-through vLLM running the model `huatuogpt-o1-72b-4bit`. The Hugging Face path of
-the model is `mlx-community/HuatuoGPT-o1-72B-4bit`.
+through vLLM running the model `huatuogpt-o1-72b-4bit`. The Hugging Face path
+of the model is `mlx-community/HuatuoGPT-o1-72B-4bit`.
 
-The file `TAG_SCHEMA.txt` specifies all the tags and what each of them contain.
+The file `TAG_SCHEMA.txt` specifies all the tags and what each of them
+contains. Regenerate it with `python3 rewrite_medical_md.py --print-schema`.
 
 To run it, simply use:
 
@@ -22,6 +38,14 @@ To run it, simply use:
     -v \
     --cache-dir ./artifacts/rewrite_cache
 
-To process multiple documents at once, use the `batch_process.sh` script and put
-all the input documents in an `./inputs` directory. This script will create an
-`artifacts` directory where all the outputs will go.
+To process multiple documents at once, use the `batch_process.sh` script. Put
+the input documents under `./inputs`, organised by subject and book:
+
+  inputs/biochemistry/harpers_illustrated_biochemistry/chapter_1.md
+
+The script walks that tree, mirrors its structure into `./artifacts/outputs`,
+and passes any extra arguments straight through, so `./batch_process.sh
+--offline` runs the whole corpus without touching the network.
+
+Every run checks that no source paragraph was lost, reporting any that were as
+warnings on stderr and exiting non-zero.

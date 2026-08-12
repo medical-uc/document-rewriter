@@ -3,29 +3,36 @@
 rewrite_medical_md.py
 =====================
 
-Rewrite slide-derived medical-school markdown (imperfectly converted from PDF)
-into a fresh, coherent, tagged markdown study document of roughly the same
-length -- while preserving every ``[FIGURE:...]`` embedded in the source.
+Convert medical textbook chapters (imperfectly extracted from PDF) into tagged
+markdown study documents for the knowledge-graph pipeline.
 
-The source markdown is treated as a *topic reference*: it tells the pipeline
-WHAT to write about, not HOW to phrase it. The prose is written fresh, with
-the missing connective tissue and context that the slide dump lacks.
+The governing rule is faithfulness. A textbook chapter is already finished
+prose, so the body text is carried over rather than rewritten: every content
+paragraph in the source reaches a ``<con>`` in the output, with only the
+mechanical repairs the PDF extractor makes necessary. The document metadata is
+the one place inference is allowed, because the source has no counterpart for
+it.
 
-Figure captions/descriptions are the one exception: those are rewritten
-*conservatively* -- the model may only reorganise the existing description
-into flowing sentences, never invent new visual detail.
+An earlier version of this tool targeted slide-derived markdown, where the
+source was a keyword dump with no connected prose. There, generation was the
+only option and most of the machinery existed to keep generated prose honest.
+None of that applies to a textbook, and none of it survives.
 
 Pipeline
 --------
-  1. parse      -- split source into headings/blocks/figures/references
-  2. outline    -- one LLM call -> document plan (title, sections, weights)
-  3. captions   -- one LLM call per figure -> <cap> + <desc> (conservative)
-  4. placement  -- one LLM call -> figure -> section assignment
-                   (deterministic lexical fallback if the model misbehaves)
-  5. sections   -- one LLM call per section -> fresh prose + key points +
-                   definitions + clinical note, with inline [[FIG:id]] anchors
-  6. summary    -- one LLM call -> closing synthesis
-  7. render     -- assemble the tagged markdown
+  1. normalise  -- repair the PDF extractor's damage (see below)
+  2. parse      -- scan into a flat element stream in source order
+  3. metadata   -- title/objectives/summary/glossary from the source;
+                   one LLM call for <topic>, which has no source counterpart
+  4. link       -- turn in-document 'Figure 2-1' mentions into <figref>
+  5. render     -- assemble the tagged markdown
+  6. verify     -- prove every source paragraph reached the output
+
+Extraction damage repaired in stage 1
+-------------------------------------
+  * U+00A0 is used as the word separator throughout;
+  * U+00AD stands in for a real hyphen ('Henderson<AD>Hasselbalch');
+  * paragraphs are split mid-sentence wherever a page break fell.
 
 Backend
 -------
@@ -38,13 +45,13 @@ scaffolding (and any <think> block) is stripped from every completion.
 
 Output tag vocabulary
 ---------------------
-See TAG_VOCABULARY below and the README table printed by ``--print-schema``.
+See TAG_VOCABULARY below and the table printed by ``--print-schema``.
 
 Usage
 -----
-    python rewrite_medical_md.py input.md -o output.md
-    python rewrite_medical_md.py input.md -o out.md --workers 6 --verbose
-    python rewrite_medical_md.py input.md --dry-run -o out.md   # no network
+    python rewrite_medical_md.py chapter.md -o out.md
+    python rewrite_medical_md.py chapter.md -o out.md --offline   # no network
+    python rewrite_medical_md.py chapter.md -o out.md -v --cache-dir ./cache
     python rewrite_medical_md.py --print-schema
 
 Zero third-party dependencies (stdlib only).
@@ -56,15 +63,14 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
-import math
 import os
 import re
 import sys
+import textwrap
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -78,41 +84,21 @@ DEFAULT_TIMEOUT = 900          # seconds; a 72B 4-bit MLX server is not fast
 DEFAULT_RETRIES = 4
 DEFAULT_WORKERS = 4
 
-MAXTOK_OUTLINE = 4096
-MAXTOK_CAPTION = 2048
-MAXTOK_PLACEMENT = 2048
-MAXTOK_EXTRAS = 1536
-MAXTOK_SUMMARY = 1536
+MAXTOK_TOPIC = 1024
+MAXTOK_CAPTION = 1024
+MAXTOK_OBJECTIVES = 2048
+MAXTOK_SUMMARY = 2048
 
-TEMP_OUTLINE = 0.35
+TEMP_TOPIC = 0.30
 TEMP_CAPTION = 0.15            # conservative: stay close to the source text
-TEMP_PLACEMENT = 0.10
-TEMP_SECTION = 0.55
-TEMP_EXTRAS = 0.40
-TEMP_SUMMARY = 0.45
-
-MIN_SECTION_WORDS = 110
-MAX_SECTION_WORDS = 950
-
-# A section is treated as a generation failure below this fraction of target.
-MIN_CONTENT_RATIO = 0.35
-MAX_FIGS_PER_SECTION = 6
-
-
-def section_token_budget(target_words: int, override: int = 0) -> int:
-    """Reasoning models spend a lot of tokens before the answer starts.
-
-    Budget = the prose itself (~1.5 tokens/word) plus generous headroom for
-    the '## Thinking' block that HuatuoGPT-o1 emits first.
-    """
-    if override:
-        return override
-    return int(max(3072, min(10240, target_words * 2.4 + 3000)))
+TEMP_OBJECTIVES = 0.35
+TEMP_SUMMARY = 0.35
 
 VERBOSE = False
 
 
 def log(msg: str) -> None:
+    """Write a progress line to stderr, but only under --verbose."""
     if VERBOSE:
         sys.stderr.write("[rewrite] " + msg + "\n")
         sys.stderr.flush()
@@ -122,87 +108,118 @@ def log(msg: str) -> None:
 # Tag vocabulary (documented, comprehensive)
 # --------------------------------------------------------------------------
 
+# (tag, where it appears, what it holds)
 TAG_VOCABULARY: List[Tuple[str, str, str]] = [
-    # (tag, where it appears, what it holds)
-    ("doc",   "root",              "Wraps the entire generated document."),
-    ("meta",  "doc",               "Document-level metadata block."),
-    ("title", "meta",              "Document title. Plain text, no '#' marker."),
-    ("topic", "meta",              "One-line statement of the subject matter."),
-    ("src",   "meta",              "Provenance: source filename, figure count, model, timestamp."),
-    ("obj",   "doc",               "Learning objectives."),
-    ("goal",  "obj",               "One learning objective. One per element, no bullet marker."),
-    ("sec",   "doc",               "One section. Attributes: id, level."),
-    ("head",  "sec",               "Section heading. Plain text; depth lives in sec/@level."),
-    ("con",   "sec",               "Narrative content prose. May occur several times per "
-                                   "section when figures are interleaved into the flow."),
-    ("fig",   "sec / doc",         "A figure. Attribute: id. Always contains the literal "
-                                   "[FIGURE:id] marker from the source, plus <cap> and <desc>."),
-    ("cap",   "fig",               "Short one-sentence caption for the figure."),
-    ("desc",  "fig",               "Figure description, restricted to what a sighted reader "
-                                   "would lose without the image: layout, colour, arrow "
-                                   "direction, what is labelled where. Claims that stay "
-                                   "true with the figure deleted are moved into <con>."),
-    ("key",   "sec",               "Key points for the section."),
-    ("pt",    "key",               "One key point. One per element, no bullet marker."),
-    ("def",   "sec",               "Terms introduced by the section."),
-    ("term",  "def",               "One definition, phrased as a complete sentence that "
-                                   "begins with the term (e.g. 'Thyroglobulin is a ...')."),
-    ("clin",  "sec",               "Clinical relevance or correlation note."),
-    ("tbl",   "sec",               "A table carried over or reconstructed from the source."),
-    ("note",  "sec",               "Aside, caveat, or a machine-readable generation warning "
-                                   "(attribute status=\"failed\") when a section could not "
-                                   "be written."),
-    ("sum",   "doc",               "Closing synthesis of the whole document."),
-    ("ref",   "doc",               "Reference list."),
-    ("cit",   "ref",               "A single citation."),
+    ("doc", "root", "Wraps the entire generated document."),
+    ("meta", "doc", "Document-level metadata block."),
+    ("title", "meta", "Chapter title. Plain text, no '#' marker."),
+    ("topic", "meta", "One-line statement of the subject matter. The only "
+                      "element inferred rather than carried over."),
+    ("src", "meta", "Provenance: source filename, book, figure and table "
+                    "counts, model, timestamp."),
+    ("obj", "doc", "Learning objectives, from the chapter's OBJECTIVES list."),
+    ("goal", "obj", "One learning objective. One per element, no bullet "
+                    "marker."),
+    ("sec", "doc", "One section. Attributes: id, level. Sections are flat; "
+                   "depth is carried by the level attribute."),
+    ("head", "sec", "Section heading, verbatim from the source."),
+    ("con", "sec", "A content paragraph carried over from the source. Only "
+                   "three things are changed: extraction artefacts are "
+                   "repaired, page-break splits are rejoined, and in-document "
+                   "figure and table mentions are wrapped in <figref>/<tblref>."),
+    ("fig", "sec", "A figure, emitted at the position it occupied in the "
+                   "source. Attributes: id; label when the source numbered "
+                   "it; src when it carried an image file; panel for the "
+                   "'A'/'B' letter on an unnumbered inline diagram."),
+    ("cap", "fig / tbl", "Caption, taken from the source text."),
+    ("desc", "fig", "Figure description. Emitted empty and reserved: nothing "
+                    "in a textbook chapter describes the image itself."),
+    ("figref", "con", "A reference to a <fig> in this document. Attribute: "
+                      "id. Wraps the original mention text, so the prose "
+                      "reads unchanged with the tags removed."),
+    ("tbl", "sec", "A table, emitted at its source position. Attributes: id, "
+                   "label. Holds <cap> and the source table markup."),
+    ("tblref", "con", "A reference to a <tbl> in this document. Attribute: "
+                      "id. Wraps the original mention text."),
+    ("sum", "doc", "Chapter summary, from the source SUMMARY section."),
+    ("def", "doc", "Glossary, from the source GLOSSARY section."),
+    ("term", "def", "One definition, phrased as a complete sentence that "
+                    "begins with the term (e.g. 'Bioethics is the area ...')."),
+    ("ref", "doc", "Reference list, from the source RECOMMENDED READING."),
+    ("cit", "ref", "A single citation."),
 ]
 
 SCHEMA_NOTES = """
-Markdown syntax policy
-----------------------
-The tags carry the document structure, so structural markdown is not emitted:
-  * <title> and <head> hold plain text -- no '#' or '##' markers. Heading depth
-    is expressed by the level attribute on <sec>.
-  * List items are elements (<goal>, <pt>, <term>, <cit>), not '- ' bullets.
-  * Inline emphasis (**bold**, *italic*) is stripped from generated text by
-    default. Pass --keep-emphasis to retain it.
-Prose style
------------
-Generated prose is held to a fixed style contract, enforced by prompt and then
-checked by a deterministic linter with an optional repair pass:
-  * every sentence names its own subject (no leading "It/They/These/This/Such",
-    no backward-pointing "its"/"their");
-  * quantity words stay welded to their substance ("iodine deficiency", never
-    "a deficiency in dietary iodine");
-  * causation is a verb and the cause is the subject ("Graves' disease causes
-    hyperthyroidism", never "is a frequent cause of");
-  * enumerations repeat the head noun ("type 1 deiodinase and type 2
-    deiodinase");
-  * an abbreviation is fixed once as "thyroxine (T4)" and then never alternates.
+FAITHFULNESS
 
-Content-level markdown INSIDE <con> is preserved: if a section body genuinely
-needs a short list or a table, that stays as markdown, because it is part of the
-content rather than part of the document skeleton. The literal [FIGURE:id]
-markers are likewise never touched.
+The chapter is a finished text, so <con> is carried over, not rewritten.
+Every content paragraph in the source reaches exactly one <con>, and the
+tool warns loudly rather than silently dropping one. The only edits applied
+to carried-over text are mechanical repairs to PDF extraction damage:
+
+  * U+00A0 word separators become ordinary spaces;
+  * U+00AD, which the extractor emits in place of a real hyphen, becomes
+    an ASCII '-';
+  * paragraphs split mid-sentence at a page break are rejoined.
+
+MARKDOWN SYNTAX POLICY
+
+The tags carry the document structure, so structural markdown is not
+emitted:
+
+  * <title> and <head> hold plain text, with no '#' or '##' markers.
+    Heading depth is expressed by the level attribute on <sec>.
+  * List items are elements (<goal>, <term>, <cit>), not '- ' bullets.
+
+Content-level markup inside <con>, <cap> and <tbl> is preserved exactly as
+the source had it. That includes inline emphasis, <sup> and <sub>, LaTeX
+spans such as $\\mathsf{pK_a}$, the HTML <table> blobs the extractor
+produces, and any mermaid diagram carried inside a <fig>. Nothing in
+element content is entity-escaped, because escaping would corrupt that
+markup; only attribute values are escaped.
+
+CROSS-REFERENCES
+
+A mention of a figure or table defined in this chapter is wrapped in place:
+
+    ... clinical insights (<figref id="fig-1-1">Figure 1-1</figref>).
+
+Mentions that point outside the chapter, such as 'see Figure 40-5', are
+left as plain text, because there is nothing in this document to link to.
+Removing the tags restores the source sentence exactly.
+
+BLOCK SHAPES
+
+    <fig id="fig-2-1" label="Figure 2-1" src="images/a1b2c3.jpg">
+    <cap>The water molecule has tetrahedral geometry.</cap>
+    <desc></desc>
+    </fig>
+
+    <tbl id="tbl-2-1" label="Table 2-1">
+    <cap>Bond Energies for Atoms of Biologic Significance</cap>
+    <table>...</table>
+    </tbl>
 """
+
+SCHEMA_WIDTH = 78
 
 
 def print_schema() -> None:
-    w1 = max(len(t) for t, _, _ in TAG_VOCABULARY) + 2
+    """Print the tag vocabulary and the conventions that govern the output."""
+    w1 = max(len(t) for t, _, _ in TAG_VOCABULARY) + 3
     w2 = max(len(p) for _, p, _ in TAG_VOCABULARY) + 2
-    print("Output tag vocabulary")
-    print("=" * 76)
+    body = SCHEMA_WIDTH - w1 - w2
+
+    print("OUTPUT TAG VOCABULARY")
+    print()
     print(f"{'TAG'.ljust(w1)}{'PARENT'.ljust(w2)}MEANING")
-    print("-" * 76)
+    print()
     for tag, parent, meaning in TAG_VOCABULARY:
-        print(f"{('<' + tag + '>').ljust(w1)}{parent.ljust(w2)}{meaning}")
+        lines = textwrap.wrap(meaning, body) or [""]
+        print(f"{('<' + tag + '>').ljust(w1)}{parent.ljust(w2)}{lines[0]}")
+        for line in lines[1:]:
+            print(" " * (w1 + w2) + line)
     print(SCHEMA_NOTES)
-    print("Figure blocks always look like:")
-    print("    <fig id=\"p5_b2\">")
-    print("    [FIGURE:p5_b2]")
-    print("    <cap>...</cap>")
-    print("    <desc>...</desc>")
-    print("    </fig>")
 
 
 # --------------------------------------------------------------------------
@@ -210,7 +227,7 @@ def print_schema() -> None:
 # --------------------------------------------------------------------------
 
 class LLMError(RuntimeError):
-    pass
+    """Raised when the backend is unreachable or answers with junk."""
 
 
 class LLMClient:
@@ -225,6 +242,11 @@ class LLMClient:
         cache_dir: Optional[str] = None,
         debug_dir: Optional[str] = None,
     ) -> None:
+        """Configure the backend.
+
+        Creates cache_dir and debug_dir if given. Neither is required; both
+        default to off.
+        """
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
@@ -238,6 +260,9 @@ class LLMClient:
 
     # -- endpoint -------------------------------------------------------
     def _endpoint(self) -> str:
+        """Return the chat-completions URL, tolerating a base url that already
+        ends in '/v1'.
+        """
         base = self.base_url
         if base.endswith("/v1"):
             return base + "/chat/completions"
@@ -245,6 +270,11 @@ class LLMClient:
 
     # -- cache ----------------------------------------------------------
     def _cache_path(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Return this request's cache file, or None when caching is off.
+
+        The key is a hash of the whole payload, so changing the prompt, the
+        model or the sampling parameters misses the cache, as it should.
+        """
         if not self.cache_dir:
             return None
         blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -253,6 +283,7 @@ class LLMClient:
     # -- public ---------------------------------------------------------
     def chat(self, system: str, user: str, max_tokens: int = 2048,
              temperature: float = 0.4, tag: str = "") -> str:
+        """Return just the model's answer. See chat_full for the parameters."""
         return self.chat_full(system, user, max_tokens, temperature, tag)[0]
 
     def chat_full(
@@ -297,6 +328,11 @@ class LLMClient:
         return final, thinking
 
     def _dump(self, tag: str, prompt: str, raw: str) -> None:
+        """Write the prompt and the unprocessed completion under --debug-dir.
+
+        Best-effort: a failed dump is logged and swallowed, because losing a
+        diagnostic file must not lose the run.
+        """
         if not self.debug_dir:
             return
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", tag or "untagged")
@@ -310,6 +346,10 @@ class LLMClient:
 
     # -- transport ------------------------------------------------------
     def _post_with_retries(self, payload: Dict[str, Any], tag: str) -> str:
+        """POST with exponential backoff, capped at 30s between attempts.
+
+        Raises LLMError once the attempt budget is exhausted.
+        """
         last: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
@@ -326,6 +366,12 @@ class LLMClient:
         raise LLMError(f"LLM request failed after {self.retries} attempts [{tag}]: {last}")
 
     def _post(self, payload: Dict[str, Any]) -> str:
+        """Issue one request and return the message content.
+
+        Reads the bearer token from VLLM_API_KEY, defaulting to 'EMPTY' for a
+        server with authentication disabled. Raises LLMError if the response
+        does not have the expected shape.
+        """
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self._endpoint(),
@@ -344,67 +390,44 @@ class LLMClient:
             raise LLMError(f"unexpected response shape: {str(body)[:400]}") from exc
 
 
-class DryRunClient(LLMClient):
-    """Offline stand-in used by --dry-run to exercise parsing/assembly."""
+class OfflineClient(LLMClient):
+    """Deterministic stand-in used by --offline; never touches the network.
 
-    def __init__(self, doc: "SourceDoc") -> None:      # noqa: D107
+    Inference is now confined to metadata, so a run with no model at all still
+    produces a complete and correct document -- only <topic> degrades, from an
+    inferred sentence to one derived from the title. That makes offline the
+    normal way to work on the parser, not merely a test mode.
+    """
+
+    def __init__(self, doc: "SourceDoc") -> None:
+        """Bind to the parsed document the derived answers are read from."""
         super().__init__(cache_dir=None)
         self.doc = doc
 
     def chat_full(self, system: str, user: str, max_tokens: int = 2048,
                   temperature: float = 0.4, tag: str = "") -> Tuple[str, str]:
-        return self._stub(tag), ""
+        """Answer from the parsed document instead of the model.
 
-    def _stub(self, tag: str) -> str:
-        if ".revise" in tag:
-            return ""            # offline: exercise the reject path
-        kind = tag.split(":", 1)[0]
-        if kind == "outline":
-            heads = [h for h in self.doc.headings if h][:10] or ["Overview"]
-            secs = [
-                {"id": f"s{i+1}", "heading": h.title(), "level": 2,
-                 "points": [h], "weight": 3}
-                for i, h in enumerate(heads)
-            ]
-            return json.dumps({
-                "title": self.doc.title_guess,
-                "topic": f"Dry-run plan derived from {len(self.doc.blocks)} source blocks.",
-                "objectives": ["(dry run) objective"],
-                "sections": secs,
-            })
-        if kind == "caption":
-            fid = tag.split(":", 1)[1] if ":" in tag else ""
-            fig = next((f for f in self.doc.figures if f.fid == fid), None)
-            raw = fig.raw if fig else ""
-            first = re.split(r"(?<=[.!?])\s", raw.strip())[0] if raw else "Figure."
-            # Hand back the raw text undivided so the deterministic desc audit
-            # is the thing under test offline.
-            return f"<<<CAP>>>\n{first}\n<<<DESC>>>\n{raw}\n<<<FACTS>>>\nNONE"
-        if kind == "placement":
-            return "[]"          # forces the lexical fallback
-        if kind == "section":
-            sid = tag.split(":", 1)[1] if ":" in tag else "?"
-            fids = [f.fid for f in self.doc.figures if f.section_id.startswith(sid)]
-            # Deliberately seeded with violations so the revision loop runs.
-            body = ("These cells are responsible for producing calcitonin. "
-                    "A deficiency during pregnancy can result in cognitive "
-                    "impairments in the child. Graves' disease is a frequent cause "
-                    "of hyperthyroidism. Type 1 and Type 2 deiodinases catalyze "
-                    "outer ring deiodination. " * 8).strip()
-            if fids:
-                body += "\n\n[[FIG:" + fids[0] + "]]\n\n" + body
-            return body
-        if kind == "extras":
-            # Deliberately exercises the shapes that used to break: a '**bold**'
-            # line with no bullet, and a 'term — definition' line.
-            return ("<<<KEY>>>\n(dry run) key point one.\n(dry run) key point two.\n"
-                    "<<<DEF>>>\n**Thyroglobulin** — A large glycoprotein scaffold.\n"
-                    "Colloid is the stored material inside each follicle.\n"
-                    "<<<CLIN>>>\n(dry run) clinical note.\n")
+        Only ``tag`` is consulted; the prompt and sampling parameters are
+        accepted and ignored so call sites need no offline special case.
+        """
+        return self._derive(tag), ""
+
+    def _derive(self, tag: str) -> str:
+        """Build the answer for one prompt tag from the source document."""
+        kind, _, arg = tag.partition(":")
+        if kind == "topic":
+            heads = [s.heading for s in self.doc.sections][:4]
+            tail = "; ".join(heads)
+            return f"{self.doc.title}." + (f" Covers {tail}." if tail else "")
+        if kind == "objectives":
+            return "\n".join(f"Understand {s.heading.lower()}."
+                             for s in self.doc.sections[:8])
         if kind == "summary":
-            return "(dry run) summary."
-        if kind.startswith("section") and ".revise" in tag:
             return ""
+        if kind == "caption":
+            fig = next((f for f in self.doc.figures if f.fid == arg), None)
+            return fig.label if fig else ""
         return ""
 
 
@@ -443,262 +466,614 @@ def split_reasoning(text: str) -> Tuple[str, str]:
     return text.strip(), thinking.strip()
 
 
-def strip_reasoning(text: str) -> str:
-    return split_reasoning(text)[0]
+# --------------------------------------------------------------------------
+# Stage 1: normalising the extractor's damage
+# --------------------------------------------------------------------------
+
+# The private-use area is where the extractor parks glyphs it could not map.
+_PUA_RE = re.compile("[\\ue000-\\uf8ff]")
+_EMPTY_TAG_RE = re.compile(r"<(sup|sub)>\s*</\1>", re.I)
+
+# Kept atomic when splitting into blocks: both span blank lines, and both are
+# meaningless in pieces.
+_ATOMIC_RE = re.compile(r"<(details|table)\b.*?</\1>", re.S | re.I)
+_NL_HOLD = "\x01"
+
+_SENTENCE_END_RE = re.compile(r"[.!?:;][\"'’”)\]]?$")
+
+
+def normalize_text(text: str) -> str:
+    """Undo the character-level damage the PDF extractor leaves behind.
+
+    U+00A0 is used as the word separator throughout the corpus and U+00AD
+    stands in for a real hyphen, so both have to go before anything tries to
+    tokenise or pattern-match the text.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u00ad", "-")
+    text = _PUA_RE.sub("", text)
+    text = _EMPTY_TAG_RE.sub("", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text
+
+
+def split_blocks(text: str) -> List[str]:
+    """Split on blank lines, holding <details> and <table> regions together."""
+    held = _ATOMIC_RE.sub(lambda m: m.group(0).replace("\n", _NL_HOLD), text)
+    parts = re.split(r"\n\s*\n", held)
+    return [p.replace(_NL_HOLD, "\n").strip() for p in parts if p.strip()]
+
+
+def join_page_breaks(blocks: Sequence[str]) -> List[str]:
+    """Rejoin paragraphs the extractor split mid-sentence at a page break.
+
+    The signature is unambiguous in this corpus: the first fragment stops
+    without sentence-final punctuation and the second resumes in lower case.
+    Requiring both conditions is what keeps genuinely separate paragraphs, and
+    the alt-text lines that follow a caption, from being glued together.
+    """
+    out: List[str] = []
+    for block in blocks:
+        if out and _is_continuation(out[-1], block):
+            out[-1] = out[-1].rstrip() + " " + block.lstrip()
+        else:
+            out.append(block)
+    return out
+
+
+def _is_continuation(prev: str, nxt: str) -> bool:
+    """Report whether nxt is the tail of a paragraph broken across a page."""
+    if _is_structural(prev) or _is_structural(nxt):
+        return False
+    if _SENTENCE_END_RE.search(prev.rstrip()):
+        return False
+    return bool(re.match(r"[a-z(]", nxt))
+
+
+def _is_structural(block: str) -> bool:
+    """Report whether a block is markup rather than prose, and so unjoinable."""
+    head = block.lstrip()
+    if head.startswith(("#", "!", "<", "|", ">")):
+        return True
+    if CREDIT_RE.match(head) or FIGURE_HEAD_RE.match(head):
+        return True
+    return bool(TABLE_HEAD_RE.match(head))
 
 
 # --------------------------------------------------------------------------
-# Source parsing
+# Stage 2: source parsing
 # --------------------------------------------------------------------------
 
-FIG_START_RE = re.compile(r"^\s*>?\s*\[FIGURE:([^\]]+)\]\s*", re.M)
+_NUM = r"(\d+)\s*[–—-]\s*(\d+)"
+
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+FIGURE_HEAD_RE = re.compile(r"^(?:#{1,6}\s+)?FIGURES?\s+" + _NUM + r"\s*(.*)$", re.S)
+TABLE_HEAD_RE = re.compile(r"^(?:#{1,6}\s+)?TABLES?\s+" + _NUM + r"\s*(.*)$", re.S)
+IMAGE_RE = re.compile(r"^!\[[^\]]*\]\(([^)]+)\)\s*(.*)$", re.S)
+DETAILS_RE = re.compile(r"^<details\b", re.I)
+TABLE_BODY_RE = re.compile(r"^<table\b", re.I)
+CREDIT_RE = re.compile(r"^Source:\s", re.I)
+CHAPTER_RE = re.compile(r"^Chapter\s+(\d+)\s*[:.–—-]\s*(.+)$", re.I)
 
-# Vocabulary that marks a paragraph as "part of a figure description".
-DESC_VOCAB = re.compile(
-    r"\b(image|figure|diagram|illustrat\w*|depict\w*|shown|shows|showing|label\w*|"
-    r"arrow\w*|leader line\w*|positioned|located|situated|top|bottom|left|right|"
-    r"corner|center|centre|colou?r\w*|red|blue|green|yellow|purple|pink|gray|grey|"
-    r"orange|brown|structure\w*|represent\w*|text|box|boxes|circle\w*|oval|"
-    r"rectangul\w*|rectangle\w*|hexagon\w*|background|section|region|panel|column|"
-    r"row|vertical\w*|horizontal\w*|layout|connected|points? (?:to|from)|"
-    r"description|visual)\b",
-    re.I,
+# The chapters name their fixed sections in a stable way; each is handled by a
+# dedicated collector rather than becoming an ordinary <sec>.
+SPECIAL_HEADINGS = {
+    "objectives": "objectives",
+    "summary": "summary",
+    "glossary": "glossary",
+    "recommended reading": "references",
+    "references": "references",
+    "further reading": "references",
+}
+
+# The machine-written alt text that trails a caption. Anchored on an opening
+# determiner and required to reach a depiction verb without crossing a full
+# stop, so a real caption or a body paragraph cannot match by accident.
+ALT_TEXT_RE = re.compile(
+    r"""^(?:An?|The|Two|Three|Four|Five|Six|Several|Illustrations?|Images?
+          |Diagrams?|Chemical|Photographs?|Micrographs?|Graphs?|Schematics?
+          |Models?|Flowcharts?|Charts?|Tables?)\b
+        [^.]{0,200}?
+        \b(?:illustrat\w*|depict\w*|show\w*|display\w*|diagram\w*|graph\w*
+            |plots?|plotted|photograph\w*|micrograph\w*|images?|models?
+            |represent\w*|reads?|marked|labell?ed|visuali[sz]\w*)\b
+    """,
+    re.X | re.I | re.S,
 )
-
-# Paragraphs that can never belong to a figure description.
-HARD_STOP_RE = re.compile(r"^\s*(#{1,6}\s|>\s*\[FIGURE:|•|\*TABLE|\|)")
 
 
 @dataclass
 class Figure:
+    """A numbered figure, or an unnumbered inline image, from the source."""
+
     fid: str
-    raw: str
+    label: str
     order: int
     caption: str = ""
-    description: str = ""
-    section_id: str = ""
-    facts: List[str] = field(default_factory=list)
+    image_src: str = ""
+    extra: str = ""
+    # 'A'/'B' on an unnumbered image: the source's only handle on that panel.
+    panel: str = ""
+    # Parsed but deliberately not rendered: <desc> is empty for now, and this
+    # is the text it would be built from.
+    alt_text: str = ""
 
 
 @dataclass
-class SourceBlock:
-    heading: str
-    text: str
-    kind: str = "para"        # para | list | table
+class Table:
+    """A numbered table and the source markup of its body."""
 
-    @property
-    def words(self) -> int:
-        return len(self.text.split())
+    tid: str
+    label: str
+    order: int
+    caption: str = ""
+    body: str = ""
+
+
+@dataclass
+class Element:
+    """One item in a section's body, in source order.
+
+    ``kind`` is 'para', 'figure' or 'table'. Exactly one of the three payload
+    fields is set.
+    """
+
+    kind: str
+    text: str = ""
+    figure: Optional[Figure] = None
+    table: Optional[Table] = None
+
+
+@dataclass
+class Section:
+    """A source heading and everything that followed it."""
+
+    sid: str
+    heading: str
+    level: int
+    elements: List[Element] = field(default_factory=list)
+
+
+@dataclass
+class Block:
+    """A source block plus the disposition the scanner gave it.
+
+    The disposition is what makes the content-preservation check in ``verify``
+    possible: every block is accounted for by name, so a paragraph the scanner
+    misreads shows up as a warning instead of vanishing.
+    """
+
+    text: str
+    disposition: str = "unclaimed"
 
 
 @dataclass
 class SourceDoc:
+    """Everything parsed out of one chapter file."""
+
     path: str
-    title_guess: str
-    headings: List[str]
-    blocks: List[SourceBlock]
+    book: str
+    title: str
+    author: str
+    sections: List[Section]
     figures: List[Figure]
+    tables: List[Table]
+    objectives: List[str]
+    summary: List[str]
+    glossary: List[str]
     references: List[str]
+    blocks: List[Block]
 
     @property
-    def prose_words(self) -> int:
-        return sum(b.words for b in self.blocks)
-
-
-def _split_paragraphs(text: str) -> List[str]:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    raw = re.split(r"\n\s*\n", text)
-    return [p.strip("\n") for p in raw if p.strip()]
-
-
-def _is_descriptive(par: str) -> bool:
-    hits = len(DESC_VOCAB.findall(par))
-    if hits >= 2:
-        return True
-    if hits >= 1 and re.match(r"^\s*([-*+]|\d+\.)\s", par):
-        return True
-    return False
-
-
-def _clean_figure_head(par: str, fid: str) -> str:
-    par = re.sub(r"^\s*>\s?", "", par, flags=re.M)
-    par = par.replace(f"[FIGURE:{fid}]", "", 1)
-    return par.strip()
+    def content_words(self) -> int:
+        """Total words across every carried-over content paragraph."""
+        return sum(word_count(e.text)
+                   for s in self.sections for e in s.elements
+                   if e.kind == "para")
 
 
 def parse_source(path: str) -> SourceDoc:
-    """Split the source markdown into headings, prose blocks, figures, refs."""
+    """Scan a chapter file into sections, figures, tables and fixed lists."""
     with open(path, "r", encoding="utf-8") as fh:
-        text = fh.read()
+        raw = fh.read()
 
-    paragraphs = _split_paragraphs(text)
+    blocks = [Block(t) for t in join_page_breaks(split_blocks(normalize_text(raw)))]
+    scanner = _Scanner(path, blocks)
+    return scanner.run()
 
-    figures: List[Figure] = []
-    kept: List[str] = []          # paragraphs that are NOT figure description
-    i = 0
-    order = 0
-    while i < len(paragraphs):
-        par = paragraphs[i]
-        m = FIG_START_RE.match(par)
-        if not m:
-            kept.append(par)
-            i += 1
+
+class _Scanner:
+    """Single forward pass over the block list.
+
+    Kept as a class only because the pass is stateful: the current section, the
+    current fixed-section collector, and the figure/table counters all have to
+    persist across blocks, and threading them through free functions was worse.
+    """
+
+    def __init__(self, path: str, blocks: List[Block]) -> None:
+        """Prepare a pass over ``blocks``, which the scan annotates in place."""
+        self.path = path
+        self.blocks = blocks
+        self.pos = 0
+        self.book = ""
+        self.title = ""
+        self.author = ""
+        self.sections: List[Section] = []
+        self.figures: List[Figure] = []
+        self.tables: List[Table] = []
+        self.objectives: List[str] = []
+        self.summary: List[str] = []
+        self.glossary: List[str] = []
+        self.references: List[str] = []
+        self.mode = "preamble"
+        self.section: Optional[Section] = None
+        self.used_ids: Dict[str, int] = {}
+
+    # -- driver ---------------------------------------------------------
+    def run(self) -> SourceDoc:
+        """Consume every block and return the assembled document."""
+        while self.pos < len(self.blocks):
+            start = self.pos
+            self._step()
+            if self.pos == start:                 # never stall
+                self.pos += 1
+        if not self.title:
+            self.title = self._fallback_title()
+        doc = SourceDoc(
+            path=self.path, book=self.book, title=self.title, author=self.author,
+            sections=[s for s in self.sections if s.elements],
+            figures=self.figures, tables=self.tables,
+            objectives=self.objectives, summary=self.summary,
+            glossary=self.glossary, references=self.references,
+            blocks=self.blocks,
+        )
+        log(f"parsed {os.path.basename(self.path)}: "
+            f"{len(doc.sections)} sections, {len(doc.figures)} figures, "
+            f"{len(doc.tables)} tables, {doc.content_words} content words")
+        return doc
+
+    def _step(self) -> None:
+        """Classify the block at the cursor and consume it and anything it owns."""
+        block = self.blocks[self.pos]
+        text = block.text
+
+        heading = HEADING_RE.match(text) if "\n" not in text else None
+        if heading and not FIGURE_HEAD_RE.match(text) and not TABLE_HEAD_RE.match(text):
+            self._open_heading(block, heading.group(2))
+            return
+        if FIGURE_HEAD_RE.match(text):
+            self._read_figure(block)
+            return
+        if TABLE_HEAD_RE.match(text):
+            self._read_table(block)
+            return
+        self._read_body(block)
+
+    # -- headings -------------------------------------------------------
+    def _open_heading(self, block: Block, title: str) -> None:
+        """Start a new section, or switch to a fixed-section collector."""
+        self.pos += 1
+        block.disposition = "heading"
+
+        chapter = CHAPTER_RE.match(title)
+        if chapter:
+            self.title = chapter.group(2).strip()
+            self.mode = "chapter"
+            self.section = None
+            return
+
+        special = SPECIAL_HEADINGS.get(title.strip().lower().rstrip(":"))
+        if special:
+            self.mode = special
+            self.section = None
+            return
+
+        self.mode = "body"
+        self.section = Section(self._section_id(title), title,
+                               _heading_level(title))
+        self.sections.append(self.section)
+
+    def _section_id(self, title: str) -> str:
+        """Slugify a heading, suffixing a counter if the slug repeats."""
+        base = re.sub(r"[^a-z0-9]+", "-", clean_inline_md(title).lower()).strip("-")
+        if len(base) > 60:                     # trim on a word boundary
+            base = base[:60].rsplit("-", 1)[0]
+        base = base or "section"
+        seen = self.used_ids.get(base, 0)
+        self.used_ids[base] = seen + 1
+        return base if not seen else f"{base}-{seen + 1}"
+
+    # -- figures --------------------------------------------------------
+    def _read_figure(self, block: Block) -> None:
+        """Consume a numbered figure and emit it at this position."""
+        m = FIGURE_HEAD_RE.match(block.text)
+        assert m is not None
+        self.pos += 1
+        block.disposition = "figure-head"
+
+        label = f"Figure {m.group(1)}-{m.group(2)}"
+        fig = Figure(fid=f"fig-{m.group(1)}-{m.group(2)}", label=label,
+                     order=len(self.figures), caption=m.group(3).strip())
+        self._read_figure_body(fig)
+        self.figures.append(fig)
+        self._emit(Element("figure", figure=fig))
+
+    def _read_figure_body(self, fig: Figure) -> None:
+        """Consume the optional parts that follow a figure head, in order.
+
+        Each part is recognised by shape, and the walk stops at the first block
+        that is not one of them, so body prose is never absorbed into a figure.
+        """
+        if not fig.caption:
+            nxt = self._peek()
+            if nxt is not None and self._is_caption_block(nxt.text):
+                fig.caption = clean_heading(nxt.text)
+                nxt.disposition = "caption"
+                self.pos += 1
+
+        nxt = self._peek()
+        if nxt is not None and _is_alt_text(nxt.text):
+            fig.alt_text = nxt.text
+            nxt.disposition = "figure-alt"
+            self.pos += 1
+
+        nxt = self._peek()
+        if nxt is not None:
+            image = IMAGE_RE.match(nxt.text)
+            if image:
+                fig.image_src = image.group(1).strip()
+                nxt.disposition = "figure-image"
+                self.pos += 1
+
+        nxt = self._peek()
+        if nxt is not None and DETAILS_RE.match(nxt.text):
+            fig.extra = _unwrap_details(nxt.text)
+            nxt.disposition = "figure-detail"
+            self.pos += 1
+
+        nxt = self._peek()
+        if nxt is not None and CREDIT_RE.match(nxt.text):
+            nxt.disposition = "credit"
+            self.pos += 1
+
+    def _is_caption_block(self, text: str) -> bool:
+        """Report whether a block could be a figure caption."""
+        if _is_alt_text(text):
+            return False
+        if IMAGE_RE.match(text) or DETAILS_RE.match(text):
+            return False
+        if CREDIT_RE.match(text) or TABLE_BODY_RE.match(text):
+            return False
+        return not FIGURE_HEAD_RE.match(text) and not TABLE_HEAD_RE.match(text)
+
+    # -- tables ---------------------------------------------------------
+    def _read_table(self, block: Block) -> None:
+        """Consume a numbered table with its body and emit it at this position."""
+        m = TABLE_HEAD_RE.match(block.text)
+        assert m is not None
+        self.pos += 1
+        block.disposition = "table-head"
+
+        label = f"Table {m.group(1)}-{m.group(2)}"
+        tbl = Table(tid=f"tbl-{m.group(1)}-{m.group(2)}", label=label,
+                    order=len(self.tables),
+                    caption=clean_heading(m.group(3).strip()))
+
+        nxt = self._peek()
+        if nxt is not None and TABLE_BODY_RE.match(nxt.text):
+            tbl.body = nxt.text.strip()
+            nxt.disposition = "table-body"
+            self.pos += 1
+
+        nxt = self._peek()
+        if nxt is not None and CREDIT_RE.match(nxt.text):
+            nxt.disposition = "credit"
+            self.pos += 1
+
+        self.tables.append(tbl)
+        self._emit(Element("table", table=tbl))
+
+    # -- body -----------------------------------------------------------
+    def _read_body(self, block: Block) -> None:
+        """Route a non-heading, non-figure block by the collector in force."""
+        self.pos += 1
+        text = block.text
+
+        if self.mode == "preamble" and not self.book:
+            self.book = clean_inline_md(text)
+            block.disposition = "book"
+            return
+        if self.mode == "chapter" and not self.author:
+            self.author = clean_inline_md(text)
+            block.disposition = "author"
+            return
+        if CREDIT_RE.match(text):
+            block.disposition = "credit"
+            return
+
+        if self.mode == "objectives":
+            self.objectives.extend(_list_items(text))
+            block.disposition = "objectives"
+            return
+        if self.mode == "summary":
+            self.summary.extend(_list_items(text))
+            block.disposition = "summary"
+            return
+        if self.mode == "glossary":
+            self.glossary.append(text)
+            block.disposition = "glossary"
+            return
+        if self.mode == "references":
+            self.references.extend(_list_items(text))
+            block.disposition = "references"
+            return
+
+        image = IMAGE_RE.match(text)
+        if image:
+            self._read_loose_image(block, image)
+            return
+        if DETAILS_RE.match(text) or TABLE_BODY_RE.match(text):
+            self._attach_to_last_figure(block)
+            return
+
+        block.disposition = "content"
+        self._emit(Element("para", text=text))
+
+    def _read_loose_image(self, block: Block, image: "re.Match[str]") -> None:
+        """An image with no FIGURE head still gets a <fig>, with a coined id.
+
+        Chapter 3 carries several of these: unnumbered structural diagrams
+        dropped inline. They are real figures and the prose sometimes points at
+        them ('as in A, in the following figure'), so discarding them would
+        lose content.
+        """
+        block.disposition = "figure-image"
+        order = len(self.figures)
+        fig = Figure(fid=f"fig-x{order + 1}", label="", order=order,
+                     image_src=image.group(1).strip(),
+                     panel=clean_heading(image.group(2))[:8])
+        self.figures.append(fig)
+        self._emit(Element("figure", figure=fig))
+
+    def _attach_to_last_figure(self, block: Block) -> None:
+        """A <details> or <table> blob trailing a figure belongs to it."""
+        target = self.figures[-1] if self.figures else None
+        if target is not None and not target.extra:
+            target.extra = (_unwrap_details(block.text)
+                            if DETAILS_RE.match(block.text) else block.text.strip())
+            block.disposition = "figure-detail"
+            return
+        block.disposition = "content"
+        self._emit(Element("para", text=block.text))
+
+    # -- shared ---------------------------------------------------------
+    def _peek(self) -> Optional[Block]:
+        """Return the block at the cursor without consuming it, or None at end."""
+        return self.blocks[self.pos] if self.pos < len(self.blocks) else None
+
+    def _emit(self, element: Element) -> None:
+        """Append to the open section, opening a catch-all one if none exists."""
+        if self.section is None:
+            self.section = Section(self._section_id("overview"), "Overview", 1)
+            self.sections.append(self.section)
+        self.section.elements.append(element)
+
+    def _fallback_title(self) -> str:
+        """Derive a title for a chapter with no 'Chapter N:' heading."""
+        for section in self.sections:
+            if section.heading:
+                return section.heading
+        return os.path.splitext(os.path.basename(self.path))[0].replace("_", " ")
+
+
+def _heading_level(title: str) -> int:
+    """Infer depth from casing, because the source makes everything '##'.
+
+    The chapters set major sections in full capitals and subsections in title
+    case, which is the only depth signal the extraction preserved.
+    """
+    letters = [c for c in title if c.isalpha()]
+    if not letters:
+        return 2
+    upper = sum(1 for c in letters if c.isupper())
+    return 1 if upper / len(letters) >= 0.8 else 2
+
+
+def _is_alt_text(text: str) -> bool:
+    """Report whether a block is the extractor's machine description of an image."""
+    return "\n" not in text.strip() and bool(ALT_TEXT_RE.match(text.strip()))
+
+
+def _unwrap_details(text: str) -> str:
+    """Strip the <details>/<summary> chrome, keeping the payload."""
+    body = re.sub(r"</?details\b[^>]*>", "", text, flags=re.I)
+    body = re.sub(r"<summary\b[^>]*>.*?</summary>", "", body, flags=re.I | re.S)
+    return body.strip()
+
+
+def _list_items(text: str) -> List[str]:
+    """Split a fixed-section block into items.
+
+    The extractor writes objectives, summary points and citations as one block
+    of lines separated by a trailing double space, so a line is an item.
+    """
+    items: List[str] = []
+    for line in text.splitlines():
+        line = strip_bullet(line)
+        if not line or line.lower().startswith("after studying this chapter"):
             continue
-
-        fid = m.group(1).strip()
-        chunks = [_clean_figure_head(par, fid)]
-        j = i + 1
-        window: List[Tuple[str, bool]] = []
-        gap = 0
-        while j < len(paragraphs):
-            nxt = paragraphs[j]
-            if HARD_STOP_RE.match(nxt):
-                break
-            desc = _is_descriptive(nxt)
-            if not desc:
-                gap += 1
-                if gap > 2:          # too much non-descriptive drift: stop
-                    break
-            else:
-                gap = 0
-            window.append((nxt, desc))
-            j += 1
-
-        # Trim trailing non-descriptive paragraphs; keep interior ones so that
-        # e.g. a bare bullet list sandwiched inside a description survives.
-        last_desc = -1
-        for k, (_, d) in enumerate(window):
-            if d:
-                last_desc = k
-        consumed = window[: last_desc + 1]
-        chunks.extend(p for p, _ in consumed)
-
-        figures.append(Figure(fid=fid, raw="\n\n".join(c for c in chunks if c).strip(),
-                              order=order))
-        order += 1
-        kept.append(f"@@FIGURE_ANCHOR:{fid}@@")
-        i = i + 1 + len(consumed)
-
-    # ---- headings, blocks, references --------------------------------
-    blocks: List[SourceBlock] = []
-    headings: List[str] = []
-    references: List[str] = []
-    current_heading = ""
-    in_refs = False
-
-    for par in kept:
-        if par.startswith("@@FIGURE_ANCHOR:"):
-            continue
-        first = par.splitlines()[0]
-        hm = HEADING_RE.match(first)
-        if hm and len(par.splitlines()) == 1:
-            current_heading = hm.group(2).strip().rstrip(":")
-            in_refs = bool(re.search(r"\breferences?\b", current_heading, re.I))
-            if not in_refs:
-                headings.append(current_heading)
-            continue
-        if in_refs:
-            for line in par.splitlines():
-                line = line.strip()
-                if re.match(r"^[-*+]\s+", line):
-                    references.append(re.sub(r"^[-*+]\s+", "", line).strip())
-                elif line:
-                    references.append(line)
-            in_refs = False
-            continue
-
-        kind = "para"
-        if par.lstrip().startswith("|") or par.lstrip().startswith("*TABLE"):
-            kind = "table"
-        elif re.match(r"^\s*([-*+•]|\d+\.)\s", par):
-            kind = "list"
-        blocks.append(SourceBlock(heading=current_heading, text=par.strip(), kind=kind))
-
-    title_guess = _guess_title(text, headings)
-    doc = SourceDoc(path=path, title_guess=title_guess, headings=headings,
-                    blocks=blocks, figures=figures, references=references)
-    log(f"parsed {os.path.basename(path)}: {len(blocks)} blocks, "
-        f"{len(figures)} figures, {len(references)} refs, {doc.prose_words} prose words")
-    return doc
+        items.append(line)
+    return items
 
 
-def _guess_title(text: str, headings: List[str]) -> str:
-    m = re.search(r"^\*\*(.+?)\*\*\s*$", text, re.M)
+def clean_heading(text: str) -> str:
+    """Drop a '##' marker and collapse whitespace, keeping inline markup."""
+    return re.sub(r"\s+", " ", MD_HEADING_RE.sub("", text)).strip()
+
+
+# --------------------------------------------------------------------------
+# Generic text helpers
+# --------------------------------------------------------------------------
+
+# A real markdown bullet is a marker FOLLOWED BY WHITESPACE. Requiring the
+# trailing space -- and refusing to treat the first '*' of '**bold**' as a
+# marker -- is what stops '**term** - x' from being mangled into '*term** - x'.
+BULLET_RE = re.compile(r"^\s*(?:[-+•‣▪]|\*(?!\*)|\d+[.)])\s+")
+
+EMPHASIS_RE = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
+MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
+
+
+def strip_bullet(line: str) -> str:
+    """Remove a leading list marker, leaving the item text."""
+    return BULLET_RE.sub("", line).strip()
+
+
+def clean_inline_md(text: str, keep_emphasis: bool = False) -> str:
+    """Drop structural markdown; optionally keep inline emphasis."""
+    text = MD_HEADING_RE.sub("", text)
+    if not keep_emphasis:
+        prev = None
+        while prev != text:                    # handles ***nested*** cases
+            prev = text
+            text = EMPHASIS_RE.sub(r"\2", text)
+    return text.strip()
+
+
+DEF_SEP_RE = re.compile(r"^(.{1,90}?)\s*(?:—|–|--|::|:)\s+(.+)$", re.S)
+_COPULA_RE = re.compile(r"^(is|are|refers?\b|denotes?\b|describes?\b|means?\b)", re.I)
+
+
+def normalize_definition(line: str, keep_emphasis: bool = False) -> str:
+    """Render a definition as a sentence: 'Bioethics is the area of ...'.
+
+    Accepts either a full sentence (passed through) or the source glossary's
+    'Term: definition' shape, which is converted.
+    """
+    s = clean_inline_md(strip_bullet(line), keep_emphasis)
+    m = DEF_SEP_RE.match(s)
     if m:
-        return m.group(1).strip()
-    for h in headings:
-        if len(h.split()) >= 2 and not re.match(r"^(references?|functions?)$", h, re.I):
-            return h.title()
-    return headings[0].title() if headings else "Study Material"
+        term, body = m.group(1).strip(), m.group(2).strip()
+        # Only de-capitalise a leading article; leave acronyms and proper
+        # nouns ('HGP: Human Genome Project ...') alone.
+        if re.match(r"^(A|An|The)\s", body):
+            body = body[0].lower() + body[1:]
+        if not _COPULA_RE.match(body):
+            body = "is " + body
+        s = f"{term} {body}"
+    s = re.sub(r"\s+", " ", s).strip()
+    if s:
+        s = s[0].upper() + s[1:]        # it is a sentence, so sentence-case it
+    if s and not s.endswith((".", "!", "?")):
+        s += "."
+    return s
 
 
-# --------------------------------------------------------------------------
-# Lightweight lexical retrieval (stdlib only)
-# --------------------------------------------------------------------------
+def word_count(text: str) -> int:
+    """Count words, ignoring markdown punctuation that would inflate the total."""
+    return len(re.sub(r"[#*`>|\[\]]", " ", text).split())
 
-STOPWORDS = set("""a an the and or of in on to for with by is are was were be been being as at from
-that this these those it its into which who whom whose what when where how not no than then also
-can may might will would should could each other more most such very between within during than
-shown show shows image figure diagram""".split())
-
-TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'\-]+")
-
-
-def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text) if t.lower() not in STOPWORDS and len(t) > 2]
-
-
-class Retriever:
-    """Tiny TF-IDF ranker over the source blocks."""
-
-    def __init__(self, blocks: Sequence[SourceBlock]) -> None:
-        self.blocks = list(blocks)
-        self.docs = [tokenize(b.heading + " " + b.text) for b in self.blocks]
-        self.df: Dict[str, int] = {}
-        for d in self.docs:
-            for t in set(d):
-                self.df[t] = self.df.get(t, 0) + 1
-        self.n = max(1, len(self.docs))
-
-    def idf(self, term: str) -> float:
-        return math.log((self.n + 1) / (self.df.get(term, 0) + 1)) + 1.0
-
-    def score(self, query_tokens: Sequence[str], doc_tokens: Sequence[str]) -> float:
-        if not doc_tokens:
-            return 0.0
-        tf: Dict[str, int] = {}
-        for t in doc_tokens:
-            tf[t] = tf.get(t, 0) + 1
-        s = 0.0
-        for q in set(query_tokens):
-            if q in tf:
-                s += self.idf(q) * (1 + math.log(tf[q]))
-        return s / math.sqrt(len(doc_tokens))
-
-    def top(self, query: str, k: int = 8, char_budget: int = 6000) -> List[SourceBlock]:
-        q = tokenize(query)
-        scored = [(self.score(q, d), i) for i, d in enumerate(self.docs)]
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        out: List[SourceBlock] = []
-        used = 0
-        for s, i in scored:
-            if s <= 0 and out:
-                break
-            b = self.blocks[i]
-            if used + len(b.text) > char_budget and out:
-                continue
-            out.append(b)
-            used += len(b.text)
-            if len(out) >= k:
-                break
-        out.sort(key=lambda b: self.blocks.index(b))
-        return out
-
-
-# --------------------------------------------------------------------------
-# JSON / delimiter helpers
-# --------------------------------------------------------------------------
 
 def extract_json(text: str) -> Any:
     """Pull the first balanced JSON object or array out of a model response."""
@@ -734,1255 +1109,24 @@ def extract_json(text: str) -> Any:
     raise ValueError("no parseable JSON found in model response")
 
 
-def split_delims(text: str, names: Sequence[str]) -> Dict[str, str]:
-    """Parse a `<<<NAME>>>`-delimited response into a dict."""
-    pattern = re.compile(r"<{2,3}\s*(" + "|".join(names) + r")\s*>{2,3}", re.I)
-    out: Dict[str, str] = {n: "" for n in names}
-    matches = list(pattern.finditer(text))
-    if not matches:
-        out[names[0]] = text.strip()
-        return out
-    for idx, m in enumerate(matches):
-        key = m.group(1).upper()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        out[key] = text[m.end():end].strip()
-    return out
+def escape_attr(value: str) -> str:
+    """Escape an attribute value.
 
-
-# A real markdown bullet is a marker FOLLOWED BY WHITESPACE. Requiring the
-# trailing space -- and refusing to treat the first '*' of '**bold**' as a
-# marker -- is what stops '**term** - x' from being mangled into '*term** - x'.
-BULLET_RE = re.compile(r"^\s*(?:[-+•‣▪]|\*(?!\*)|\d+[.)])\s+")
-
-EMPHASIS_RE = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
-MD_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
-
-
-def strip_bullet(line: str) -> str:
-    return BULLET_RE.sub("", line).strip()
-
-
-def clean_inline_md(text: str, keep_emphasis: bool = False) -> str:
-    """Drop structural markdown; optionally keep inline emphasis."""
-    text = MD_HEADING_RE.sub("", text)
-    if not keep_emphasis:
-        prev = None
-        while prev != text:                    # handles ***nested*** cases
-            prev = text
-            text = EMPHASIS_RE.sub(r"\2", text)
-    return text.strip()
-
-
-def bulletize(text: str, limit: int = 8, keep_emphasis: bool = False) -> List[str]:
-    items: List[str] = []
-    for line in text.splitlines():
-        line = strip_bullet(line)
-        if not line:
-            continue
-        line = clean_inline_md(line, keep_emphasis)
-        if line:
-            items.append(line)
-    return items[:limit]
-
-
-DEF_SEP_RE = re.compile(r"^(.{1,90}?)\s*(?:—|–|--|::|:)\s+(.+)$", re.S)
-_COPULA_RE = re.compile(r"^(is|are|refers?\b|denotes?\b|describes?\b|means?\b)", re.I)
-
-
-def normalize_definition(line: str, keep_emphasis: bool = False) -> str:
-    """Render a definition as a sentence: 'Thyroglobulin is a large ...'.
-
-    Accepts either a full sentence (passed through) or the older
-    'term — definition' shape, which is converted.
+    Element content is never escaped, because <con>, <cap> and <tbl> carry the
+    source's own markup and escaping would corrupt it. Attribute values are the
+    one place a stray quote or ampersand would break a parser, so they are the
+    one place escaping is applied.
     """
-    s = clean_inline_md(strip_bullet(line), keep_emphasis)
-    m = DEF_SEP_RE.match(s)
-    if m:
-        term, body = m.group(1).strip(), m.group(2).strip()
-        # Only de-capitalise a leading article; leave acronyms and proper
-        # nouns ('TSH — Thyroid-Stimulating Hormone ...') alone.
-        if re.match(r"^(A|An|The)\s", body):
-            body = body[0].lower() + body[1:]
-        if not _COPULA_RE.match(body):
-            body = "is " + body
-        s = f"{term} {body}"
-    s = re.sub(r"\s+", " ", s).strip()
-    if s:
-        s = s[0].upper() + s[1:]        # it is a sentence, so sentence-case it
-    if s and not s.endswith((".", "!", "?")):
-        s += "."
-    return s
+    return (value.replace("&", "&amp;").replace("<", "&lt;")
+                 .replace(">", "&gt;").replace('"', "&quot;"))
 
-
-def word_count(text: str) -> int:
-    return len(re.sub(r"[#*`>|\[\]]", " ", text).split())
-
-
-# --------------------------------------------------------------------------
-# Prose quality: the style contract, the visual/content split, and the linter
-# --------------------------------------------------------------------------
-
-STYLE_CONTRACT = """\
-WRITING RULES -- every one of these is mandatory.
-
-1. EVERY SENTENCE GETS ITS OWN SUBJECT.
-   Never open a sentence with "It", "They", "These", "Those", "This", "That" or
-   "Such", and do not point backwards with "its" or "their" when a name is
-   available. Name the thing again, even when the repetition feels heavy.
-     BAD   These cells are responsible for producing calcitonin.
-     GOOD  Parafollicular cells produce calcitonin.
-     BAD   Its function is to store hormone.
-     GOOD  Colloid stores hormone.
-
-2. NEVER STRAND A MODIFIER FROM ITS NOUN.
-   Keep "deficiency", "excess", "insufficient" and "elevated" next to the
-   substance they qualify, preferably welded into a compound noun. A reader must
-   never have to look at the previous sentence to learn a deficiency of what.
-     BAD   A deficiency in dietary iodine can lead to goiter.
-     GOOD  Iodine deficiency causes goiter.
-     BAD   Hyperthyroidism occurs when there is an excess of thyroid hormones.
-     GOOD  Excess thyroid hormone causes hyperthyroidism.
-     BAD   A deficiency during pregnancy can result in cognitive impairments.
-     GOOD  Thyroid hormone deficiency during pregnancy causes cognitive
-           impairment in the child.
-   Keep process nouns whole rather than splitting them across a clause:
-     BAD   Calcitonin acts by inhibiting bone resorption.
-     GOOD  Calcitonin inhibits bone resorption.
-
-3. STATE CAUSATION WITH A VERB, AND LEAD WITH THE CAUSE.
-   The subject of the sentence is the cause; the object is the effect; both live
-   in the SAME sentence. Prefer "causes", "leads to", "results in",
-   "progresses to". Do not write "is a cause of", "the cause is", or "is
-   responsible for".
-     BAD   Graves' disease is a frequent cause of hyperthyroidism.
-     GOOD  Graves' disease causes hyperthyroidism.
-     BAD   The most common cause is Hashimoto's thyroiditis.
-     GOOD  Hashimoto's thyroiditis is the most common cause of hypothyroidism.
-   Name the causal agent precisely rather than gesturing at a process:
-     BAD   Autoimmune reactions against thyroid peroxidase contribute to
-           Hashimoto's thyroiditis.
-     GOOD  Anti-thyroid-peroxidase autoantibodies cause Hashimoto's thyroiditis.
-
-4. REPEAT THE HEAD NOUN IN AN ENUMERATION.
-   Do not let two modifiers share one plural noun.
-     BAD   Type 1 and Type 2 deiodinases catalyze outer ring deiodination of T4.
-     GOOD  Type 1 deiodinase and type 2 deiodinase catalyze the outer ring
-           deiodination of T4, producing T3.
-
-5. FIX EACH ABBREVIATION ONCE, THEN DO NOT ALTERNATE.
-   Introduce a term as "thyroxine (T4)" on first use, then use ONE form for the
-   rest of the document. Never use the expansion and the abbreviation for the
-   same referent in a single sentence. Never let a category word stand in for a
-   specific molecule: if the sentence is about one molecule, write "T4" or "T3",
-   not "thyroid hormone".
-"""
-
-VAGUE_UMBRELLA_HINT = (
-    "6. DO NOT USE THESE VAGUE UMBRELLA TERMS FOR A SPECIFIC MOLECULE; name the "
-    "molecule instead: {terms}.\n"
-)
-
-# Inline anchor the section writer emits so figures land in the prose flow.
-FIG_MARKER_RE = re.compile(r"^[ \t]*\[?\[FIG:([^\]]+)\]\]?[ \t]*$", re.M)
-
-_ABBREV_GUARD = re.compile(
-    r"\b(e\.g|i\.e|etc|vs|cf|approx|ca|Dr|Prof|Fig|No|St|Mr|Mrs|Ms|al|Inc|Ltd)\.", re.I)
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])[ \t]+(?=[\"'(\[]?[A-Z0-9])")
-
-
-def split_sentences(text: str) -> List[str]:
-    """Sentence splitter that survives 'e.g.', decimals and 'T4.'."""
-    guarded = _ABBREV_GUARD.sub(lambda m: m.group(0).replace(".", "\x00"), text)
-    guarded = re.sub(r"(?<=\d)\.(?=\d)", "\x00", guarded)
-    out: List[str] = []
-    for line in guarded.split("\n"):
-        for part in _SENT_SPLIT_RE.split(line):
-            part = part.replace("\x00", ".").strip()
-            if part:
-                out.append(part)
-    return out
-
-
-# Cues that are visual wherever they appear: depiction verbs, graphical
-# primitives, colour, and typography.
-DEPICTION_RE = re.compile(r"""
-    \b(
-      shown|shows|showing|depict\w*|illustrat\w*|display\w*|
-      appear\w*|visible|pictured|drawn|draws|render\w*|portray\w*|
-      label\w*|labell?ed|annotat\w*|denoted|
-      arrow\w*|arrowhead\w*|leader\s+line\w*|dashed|dotted|
-      diagram|figure|image|panel|inset|legend|caption|micrograph|photograph|
-      schematic|flowchart|illustration|
-      background|foreground|
-      colou?r\w*|red|blue|green|yellow|purple|pink|orange|brown|gray|grey|
-      violet|teal|shaded|shading|hue|
-      circular|oval|hexagon\w*|rectangl\w*|square\w*|triangl\w*|
-      wavy|curved|coiled|stacked|scattered|outlined|elongated|V-shaped|
-      scale\s+bar|tick\s+mark\w*|
-      written|font|bold|italic|typeface|
-      points?\s+(?:to|from|towards?|upward|downward)
-    )\b
-""", re.X | re.I)
-
-# Position words are visual ONLY inside a frame-of-reference construction.
-# "at the top of the panel" describes the image; "the right lobe" is anatomy
-# that stays true with the figure deleted, so it belongs in <con>.
-SPATIAL_RE = re.compile(r"""
-    (?:
-      \b(?:at|on|in|to|toward|towards|from|along|across)\s+
-        the\s+(?:top|bottom|left|right|upper|lower|centre|center|middle|
-                 far\s+\w+|near\s+\w+)\b
-    | \b(?:top|bottom|upper|lower)[\s-](?:left|right|centre|center|half|
-        corner|portion|section|panel|row)\b
-    | \b(?:left|right|upper|lower|top|bottom|central|middle)\s+
-        (?:side|corner|portion|half|panel|column|row|margin|edge|inset)\b
-    | \b(?:above|below|beside|alongside|adjacent\s+to|surrounding|next\s+to)\s+
-        (?:it|this|the\s+\w+)\b
-    | \bof\s+the\s+(?:image|figure|diagram|illustration|panel|photograph)\b
-    )
-""", re.X | re.I)
-
-
-def is_visual_sentence(sentence: str) -> bool:
-    return bool(DEPICTION_RE.search(sentence) or SPATIAL_RE.search(sentence))
-
-
-def visual_split(desc: str) -> Tuple[List[str], List[str]]:
-    """Partition a description into (visual sentences, content claims).
-
-    The rule, stated by hand: if a sentence can be asserted without saying
-    "shown", "depicted", "the arrow", "on the left" or "labelled", then it is
-    not a figure description -- it is subject-matter content that belongs in
-    <con>, because it stays true when the figure is deleted.
-    """
-    visual: List[str] = []
-    content: List[str] = []
-    for sent in split_sentences(desc):
-        (visual if is_visual_sentence(sent) else content).append(sent)
-    return visual, content
-
-
-@dataclass
-class Violation:
-    kind: str
-    sentence: str
-    detail: str
-
-    def render(self) -> str:
-        return f"[{self.kind}] {self.detail}\n    > {self.sentence}"
-
-
-# -- rule 1: anaphora -------------------------------------------------------
-ANAPHOR_START_RE = re.compile(
-    r"^\s*(?:And\s+|But\s+|However,\s*|Therefore,\s*|Thus,\s*)?"
-    r"(It|They|Them|These|Those|This|That|Such|Its|Their)\b"
-    r"(?!\s+(?:is\s+worth|said|being)\b)", re.I)
-POSSESSIVE_ANAPHOR_RE = re.compile(r"\b(its|their)\s+([a-z]+)", re.I)
-
-# -- rule 2: stranded modifier ---------------------------------------------
-STRANDED_RE = re.compile(
-    r"\b(?:a|an|the)\s+(deficiency|excess|insufficiency|elevation|shortage|"
-    r"abundance)\b(?!\s+of\s+[a-z])", re.I)
-LOOSE_QUANTITY_RE = re.compile(
-    r"\b(deficiency|excess|insufficiency|elevation)\s+(?:in|of)\s+"
-    r"(?:the\s+|dietary\s+|circulating\s+)?([a-z][\w-]*)", re.I)
-THERE_IS_RE = re.compile(
-    r"\bthere\s+(?:is|are|'s)\s+(?:an?\s+)?(excess|deficiency|insufficiency|"
-    r"elevation|shortage)\b", re.I)
-
-# -- rule 3: nominalised or reversed causation ------------------------------
-NOMINAL_CAUSE_RE = re.compile(
-    r"\b(is|are|was|were)\s+(?:a|an|one\s+of\s+the)\s+"
-    r"(?:\w+\s+){0,2}(cause|causes|contributor|factor)\b", re.I)
-REVERSED_CAUSE_RE = re.compile(
-    r"\b(?:the\s+)?(?:most\s+common\s+|primary\s+|main\s+|leading\s+|chief\s+)?"
-    r"cause(?:s)?\s+(?:is|are|include[s]?|being)\b", re.I)
-RESPONSIBLE_RE = re.compile(r"\bis\s+responsible\s+for\b|\bcontribute[s]?\s+to\b", re.I)
-# "Calcitonin acts by inhibiting bone resorption" splits the verb from its
-# process noun; "Calcitonin inhibits bone resorption" keeps it whole.
-SPLIT_PROCESS_RE = re.compile(
-    r"\b(act[s]?|function[s]?|work[s]?|operate[s]?)\s+(?:by|through|via)\s+(\w+ing)\b"
-    r"|\b(?:serve[s]?|help[s]?)\s+to\s+(\w+)\b"
-    r"|\bplay[s]?\s+an?\s+(?:\w+\s+)?role\s+in\s+(\w+ing)\b", re.I)
-
-# -- rule 4: shared head noun in an enumeration -----------------------------
-SHARED_HEAD_RE = re.compile(
-    r"\b([A-Za-z][\w-]*)\s+(\d+|[IVX]+)\s+and\s+(?:\1\s+)?(\d+|[IVX]+)\s+"
-    r"([a-z][\w-]*s)\b", re.I)
-
-# -- rule 5: abbreviation handling ------------------------------------------
-ABBR_DEF_RE = re.compile(
-    r"\b([A-Za-z][\w'-]*(?:[ -][A-Za-z][\w'-]*){0,4})\s*\(([A-Za-z][A-Za-z0-9]{0,7})\)")
-
-
-def _plausible_abbreviation(expansion: str, abbr: str) -> bool:
-    """Is `abbr` plausibly short for `expansion`?"""
-    letters = [c for c in abbr if c.isalpha()]
-    if not letters or not any(c.isupper() for c in abbr):
-        return False
-    words = [w for w in re.split(r"[ -]+", expansion) if w]
-    if not words:
-        return False
-    initials = "".join(w[0] for w in words).lower()
-    joined = "".join(letters).lower()
-    if joined == initials:
-        return True                                   # thyroid-stimulating hormone (TSH)
-    if len(letters) == 1 and words and words[-1][0].lower() == letters[0].lower():
-        return True                                   # thyroxine (T4)
-    if initials.endswith(joined) or joined in initials:
-        return True
-    # Abbreviations that pick up interior letters: thyroid PerOxidase -> TPO.
-    # Require the first letter to anchor on the first word, then match the rest
-    # as an in-order subsequence of the expansion's letters.
-    flat = "".join(c for c in expansion.lower() if c.isalpha())
-    if joined and words[0][0].lower() == joined[0]:
-        pos = 0
-        for ch in joined:
-            pos = flat.find(ch, pos)
-            if pos < 0:
-                return False
-            pos += 1
-        return True
-    return False
-
-
-def find_abbreviations(text: str) -> Dict[str, str]:
-    """Map abbreviation -> expansion for every 'expansion (ABBR)' definition."""
-    pairs: Dict[str, str] = {}
-    for m in ABBR_DEF_RE.finditer(text):
-        expansion, abbr = m.group(1).strip(), m.group(2).strip()
-        if _plausible_abbreviation(expansion, abbr):
-            pairs.setdefault(abbr, expansion)
-    return pairs
-
-
-class ProseLinter:
-    """Deterministic checks for the writing rules in STYLE_CONTRACT.
-
-    The model is the primary enforcement mechanism -- this class exists to catch
-    what the model misses and to feed concrete, quotable violations back into a
-    revision pass.
-    """
-
-    def __init__(self, vague_terms: Sequence[str] = ()) -> None:
-        self.vague_terms = [t.strip().lower() for t in vague_terms if t.strip()]
-
-    # -- public ---------------------------------------------------------
-    def lint(self, text: str) -> List[Violation]:
-        stripped = FIG_MARKER_RE.sub("", text)
-        sentences = split_sentences(stripped)
-        out: List[Violation] = []
-        for sent in sentences:
-            out.extend(self._anaphora(sent))
-            out.extend(self._stranded(sent))
-            out.extend(self._causation(sent))
-            out.extend(self._enumeration(sent))
-            out.extend(self._vague(sent))
-        out.extend(self._abbreviations(stripped, sentences))
-        return out
-
-    # -- rules ----------------------------------------------------------
-    def _anaphora(self, s: str) -> List[Violation]:
-        v: List[Violation] = []
-        m = ANAPHOR_START_RE.match(s)
-        if m:
-            v.append(Violation(
-                "anaphora", s,
-                f'Sentence opens with "{m.group(1)}". Name the referent instead.'))
-        for pm in POSSESSIVE_ANAPHOR_RE.finditer(s):
-            v.append(Violation(
-                "anaphora", s,
-                f'"{pm.group(0)}" points backwards. Write the owner\'s name.'))
-            break
-        return v
-
-    def _stranded(self, s: str) -> List[Violation]:
-        v: List[Violation] = []
-        m = STRANDED_RE.search(s)
-        if m:
-            v.append(Violation(
-                "stranded-modifier", s,
-                f'"{m.group(0)}" does not say a {m.group(1)} of what. '
-                f'Use a compound noun such as "iodine {m.group(1)}".'))
-        m = LOOSE_QUANTITY_RE.search(s)
-        if m:
-            v.append(Violation(
-                "stranded-modifier", s,
-                f'"{m.group(0)}" separates the quantity from the substance. '
-                f'Write "{m.group(2)} {m.group(1).lower()}".'))
-        m = THERE_IS_RE.search(s)
-        if m:
-            v.append(Violation(
-                "stranded-modifier", s,
-                f'"{m.group(0)}" buries the subject. Lead with the substance.'))
-        return v
-
-    def _causation(self, s: str) -> List[Violation]:
-        v: List[Violation] = []
-        if NOMINAL_CAUSE_RE.search(s):
-            v.append(Violation(
-                "nominal-causation", s,
-                'Causation stated as a noun ("is a cause of"). Use a verb: '
-                '"X causes Y".'))
-        if REVERSED_CAUSE_RE.search(s):
-            v.append(Violation(
-                "reversed-causation", s,
-                'The effect is the subject ("the cause is X"). Lead with the '
-                'cause: "X causes Y" or "X is the most common cause of Y".'))
-        m = RESPONSIBLE_RE.search(s)
-        if m:
-            v.append(Violation(
-                "nominal-causation", s,
-                f'"{m.group(0)}" is vague about the causal relation. Use '
-                f'"causes", "leads to" or "results in".'))
-        m = SPLIT_PROCESS_RE.search(s)
-        if m:
-            verb = next((g for g in m.groups() if g), "")
-            v.append(Violation(
-                "split-process", s,
-                f'"{m.group(0)}" splits the verb from its process noun. '
-                f'Make "{verb}" the main verb.'))
-        return v
-
-    def _enumeration(self, s: str) -> List[Violation]:
-        m = SHARED_HEAD_RE.search(s)
-        if m:
-            head = m.group(4)
-            singular = head[:-2] if head.endswith("es") and len(head) > 4 else head[:-1]
-            return [Violation(
-                "shared-head-noun", s,
-                f'"{m.group(0)}" makes two modifiers share one plural noun. '
-                f'Write "{m.group(1)} {m.group(2)} {singular} and '
-                f'{m.group(1).lower()} {m.group(3)} {singular}".')]
-        return []
-
-    def _vague(self, s: str) -> List[Violation]:
-        low = s.lower()
-        for term in self.vague_terms:
-            if term in low:
-                return [Violation(
-                    "vague-umbrella", s,
-                    f'"{term}" stands in for a specific molecule. Name it.')]
-        return []
-
-    def _abbreviations(self, text: str, sentences: Sequence[str]) -> List[Violation]:
-        pairs = find_abbreviations(text)
-        out: List[Violation] = []
-        for abbr, expansion in pairs.items():
-            exp_re = re.compile(r"\b" + re.escape(expansion) + r"\b", re.I)
-            abbr_re = re.compile(r"\b" + re.escape(abbr) + r"\b")
-            # Both forms in one sentence. The definition site "expansion (ABBR)"
-            # is legal and must be blanked WHOLE -- blanking only "(ABBR)" would
-            # leave the expansion behind and flag every legitimate definition.
-            defsite_re = re.compile(
-                r"\b" + re.escape(expansion) + r"\s*\(\s*" + re.escape(abbr) + r"\s*\)",
-                re.I)
-            for sent in sentences:
-                probe = defsite_re.sub(" ", sent)
-                if exp_re.search(probe) and abbr_re.search(probe):
-                    out.append(Violation(
-                        "abbreviation-mixing", sent,
-                        f'"{expansion}" and "{abbr}" both name the same thing in '
-                        f'one sentence. Keep one form.'))
-                    break
-                if defsite_re.search(sent) and len(exp_re.findall(probe)) >= 1:
-                    out.append(Violation(
-                        "abbreviation-mixing", sent,
-                        f'"{expansion}" is defined as "{abbr}" and then used in '
-                        f'long form again in the same sentence. Switch to '
-                        f'"{abbr}" immediately after the definition.'))
-                    break
-            # Any reuse of the long form after the definition is a violation:
-            # once the short form is fixed, one form is used from then on. This
-            # fires whether or not the abbreviation is also still in play.
-            split = defsite_re.split(text, maxsplit=1)
-            if len(split) >= 2:
-                after = split[-1]
-                reuse = len(exp_re.findall(after))
-                if reuse >= 1:
-                    out.append(Violation(
-                        "abbreviation-alternation", f"{expansion} / {abbr}",
-                        f'After defining "{expansion} ({abbr})" the long form is '
-                        f'used {reuse} more time(s). Use "{abbr}" from then on.'))
-        return out
-
-
-def summarize_violations(violations: Sequence[Violation]) -> str:
-    counts: Dict[str, int] = {}
-    for v in violations:
-        counts[v.kind] = counts.get(v.kind, 0) + 1
-    return ", ".join(f"{k}={n}" for k, n in sorted(counts.items())) or "none"
-
-
-# --------------------------------------------------------------------------
-# Prompts
-# --------------------------------------------------------------------------
-
-SYS_EDUCATOR = (
-    "You are an experienced medical educator and textbook author. You write clear, "
-    "accurate, well-organised study material for medical students. You explain "
-    "mechanisms rather than listing keywords, you supply the connective context that "
-    "lecture slides omit, and you never invent clinical facts you are unsure of. "
-    "You write in plain markdown and never wrap your answer in code fences."
-)
-
-SYS_CAPTIONER = (
-    "You are a scientific copy-editor preparing figure captions. You are given a raw, "
-    "machine-generated description of a figure. Your job is to rewrite that raw text "
-    "into fluent sentences AND to separate it into two kinds of statement: what a "
-    "sighted reader would lose without the image, and subject-matter claims that stay "
-    "true with the image deleted. You must not add any visual detail, structure, "
-    "label, colour, quantity or relationship that is not already in the raw "
-    "description, and you must not delete substantive content: every statement in the "
-    "raw text must end up in one bucket or the other. You are re-sorting and "
-    "re-phrasing, never summarising and never embellishing."
-)
-
-SYS_PLANNER = (
-    "You are a curriculum designer structuring a medical study document. "
-    "You respond with valid JSON only, no prose, no code fences."
-)
-
-
-def prompt_outline(doc: SourceDoc, target_words: int, max_chars: int) -> str:
-    source_view = "\n\n".join(f"[{b.heading}] {b.text}" for b in doc.blocks)
-    if len(source_view) > max_chars:
-        source_view = source_view[:max_chars] + "\n...[truncated]"
-
-    fig_view = "\n".join(
-        f"- {f.fid}: {' '.join(f.raw.split())[:220]}" for f in doc.figures
-    ) or "(none)"
-
-    # Enough sections that no single one has to carry a pile of figures.
-    n_min = max(6, math.ceil(len(doc.figures) / MAX_FIGS_PER_SECTION))
-    plan_hint = f"{n_min} to {max(n_min + 4, 12)} sections"
-
-    return (
-        "Below is a fragmented set of lecture-slide notes converted from a PDF. It is "
-        "disorganised, full of bare keyword bullets, and missing explanatory context.\n\n"
-        "Your task is to plan a FRESH study document on the same subject matter. Use the "
-        "notes only to decide WHICH topics belong in the document and in what depth. Do "
-        "not plan to copy their wording or their ragged slide-by-slide ordering. Design "
-        "the structure a good textbook chapter would use.\n\n"
-        "The finished document should total roughly " + str(target_words) + " words of "
-        "prose. Plan " + plan_hint + ".\n\n"
-        "You must also accommodate the figures listed further below: every one of them "
-        "will be placed into one of your sections, so make sure sections exist that "
-        "those figures naturally belong to.\n\n"
-        "=== SOURCE NOTES ===\n" + source_view + "\n=== END SOURCE NOTES ===\n\n"
-        "=== FIGURE INVENTORY ===\n" + fig_view + "\n=== END FIGURE INVENTORY ===\n\n"
-        "Respond with JSON of exactly this shape:\n"
-        '{"title": "...", "topic": "one sentence", '
-        '"objectives": ["...", "..."], '
-        '"sections": [{"id": "s1", "heading": "...", "level": 2, '
-        '"points": ["specific thing to cover", "..."], "weight": 3, '
-        '"wants_definitions": true, "wants_clinical": false}]}\n\n'
-        "weight is 1-5 and controls how long that section should be. "
-        "points must be concrete content commitments, 2-6 per section. "
-        "Output JSON only."
-    )
-
-
-def prompt_caption(fig: Figure, doc_title: str) -> str:
-    return (
-        f"Document subject: {doc_title}\n"
-        f"Figure identifier: {fig.fid}\n\n"
-        "Raw machine-generated description:\n"
-        "-----\n" + fig.raw + "\n-----\n\n"
-        "Produce three things.\n\n"
-        "1. CAP -- a caption: ONE sentence naming what the figure shows, derived "
-        "strictly from the raw text above.\n\n"
-        "2. DESC -- the visual description, and ONLY the visual content: what a "
-        "sighted reader would lose by not seeing the image. That means layout, "
-        "colour, shape, arrow direction, what is labelled and where, which parts sit "
-        "next to which. Write it as flowing prose rather than a numbered inventory.\n\n"
-        "   THE TEST: if you can state a sentence without saying \"shown\", "
-        "\"depicted\", \"the arrow\", \"on the left\", \"labelled\" or similar, it is "
-        "NOT a figure description. It is subject-matter content, and it goes in "
-        "FACTS instead.\n"
-        "   Anatomical names are not positions: \"the right lobe and the left lobe\" "
-        "is anatomy and belongs in FACTS, whereas \"the right lobe is drawn at the "
-        "top left of the panel\" is layout and belongs in DESC.\n\n"
-        "3. FACTS -- every claim in the raw text that stays true with the image "
-        "deleted: mechanisms, quantities, anatomical relationships, what a structure "
-        "does. One claim per line, no bullet characters. Write each as a standalone "
-        "sentence that names its own subject, because these lines are handed to a "
-        "writer who cannot see the figure. Write \"Iodide is concentrated about "
-        "30-fold above plasma\", never \"it is concentrated 30-fold\".\n"
-        "   Do not invent claims. If the raw text is purely visual, write NONE.\n\n"
-        "Every statement in the raw text must appear in DESC or in FACTS. Do not "
-        "drop anything and do not put the same statement in both.\n\n"
-        "Where the raw text says \"it\", \"they\", \"these cells\" or \"this "
-        "structure\", replace the pronoun with the name it refers to, using only "
-        "names already present in the raw text above.\n\n"
-        "Respond in exactly this format:\n"
-        "<<<CAP>>>\n(one sentence)\n<<<DESC>>>\n(visual prose)\n<<<FACTS>>>\n"
-        "(one claim per line, or NONE)"
-    )
-
-
-def prompt_placement(outline: "Outline", figures: Sequence[Figure]) -> str:
-    secs = "\n".join(
-        f"- {s.sid}: {s.heading} :: " + "; ".join(s.points) for s in outline.sections
-    )
-    figs = "\n".join(
-        f"- {f.fid}: {f.caption or ' '.join(f.raw.split())[:200]}" for f in figures
-    )
-    return (
-        "You are placing figures into a study document.\n\n"
-        "=== SECTIONS ===\n" + secs + "\n\n"
-        "=== FIGURES ===\n" + figs + "\n\n"
-        "Assign EVERY figure to exactly one section, choosing the section whose subject "
-        "matter the figure actually illustrates. A section may receive several figures; "
-        "a section may receive none.\n\n"
-        'Respond with JSON only: [{"fid": "...", "sid": "..."}, ...]'
-    )
-
-
-def prompt_section_prose(
-    outline: "Outline",
-    sec: "PlannedSection",
-    excerpts: Sequence[SourceBlock],
-    figs: Sequence[Figure],
-    target_words: int,
-    insist: bool = False,
-    style: str = "",
-) -> str:
-    """Prose-only prompt.
-
-    Deliberately asks for ONE thing. An earlier version asked for prose plus
-    key points plus definitions plus a clinical note in a single delimited
-    response; the model reliably filled the three short parts and left the long
-    one empty. Splitting the call fixed that.
-    """
-    src = "\n\n".join(f"- {b.text}" for b in excerpts) or "(no closely matching notes)"
-    if figs:
-        figline = "\n".join(f"[[FIG:{f.fid}]] -- {f.caption}" for f in figs)
-        fig_instr = (
-            "\nThis section carries the following figures:\n" + figline + "\n\n"
-            "Place each marker on its own line at the point in your prose where that "
-            "figure belongs, and refer to it naturally in the surrounding sentences. "
-            "Use each marker exactly once. Do not put a marker in the first or last "
-            "line of the section.\n"
-        )
-    else:
-        fig_instr = ""
-
-    facts: List[str] = []
-    for f in figs:
-        facts.extend(f.facts)
-    if facts:
-        fact_block = (
-            "\n=== CLAIMS TAKEN OUT OF THIS SECTION'S FIGURE DESCRIPTIONS ===\n"
-            + "\n".join(f"- {x}" for x in _dedupe_facts(facts))
-            + "\n=== END CLAIMS ===\n\n"
-            "These claims were removed from the figure descriptions because they "
-            "stay true with the figures deleted. Work them into your prose. Do not "
-            "write them back as descriptions of the figures.\n"
-        )
-    else:
-        fact_block = ""
-
-    others = "; ".join(s.heading for s in outline.sections if s.sid != sec.sid)
-
-    urgency = ""
-    if insist:
-        urgency = (
-            "\nIMPORTANT: your previous attempt returned no usable text. Do not plan, "
-            "do not comment on the task, do not restate these instructions. Begin your "
-            "reply with the first sentence of the section itself.\n"
-        )
-
-    return (
-        f"Document: {outline.title}\n"
-        f"Subject: {outline.topic}\n"
-        f"Other sections (do not duplicate their material): {others}\n\n"
-        f"Write the body of the section titled: {sec.heading}\n\n"
-        "It must cover:\n" + "\n".join(f"- {p}" for p in sec.points) + "\n\n"
-        f"Target length: about {target_words} words. This is the single most "
-        "important requirement: the section must be substantial, not a summary.\n\n"
-        "=== REFERENCE NOTES (fragmentary slide material on this topic) ===\n"
-        + src + "\n=== END REFERENCE NOTES ===\n\n" + fact_block + style + "\n"
-        "The reference notes tell you WHAT this section should cover. They are a "
-        "keyword dump with missing context; do not paraphrase them line by line and do "
-        "not reproduce their bullet style. Write fresh, explanatory, connected prose "
-        "that a student can actually learn from: state mechanisms, give the reason "
-        "behind each fact, define terms on first use, and include the numbers and "
-        "specifics the notes mention where they are correct.\n\n"
-        "Write in full paragraphs of continuous prose. Do not answer with a bullet "
-        "list. Do not write a heading. Do not add a summary, key points, or a list of "
-        "definitions -- those are collected separately.\n"
-        + fig_instr + urgency +
-        "\nOutput the section body and nothing else."
-    )
-
-
-def prompt_section_extras(sec: "PlannedSection", content: str,
-                          style: str = "") -> str:
-    body = " ".join(content.split())[:5000]
-    want_def = ("3 to 5 definitions" if sec.wants_definitions else "0 to 3 definitions")
-    return (
-        f"Here is a finished section of a medical study document, titled "
-        f"\"{sec.heading}\":\n\n{body}\n\n"
-        "Produce three short items about THIS text only.\n\n"
-        "Respond in exactly this format, keeping every marker:\n"
-        "<<<KEY>>>\n"
-        "3 to 5 take-home points, one per line, no bullet characters. Each must be a "
-        "complete sentence. Do not simply copy sentences from the text.\n"
-        "<<<DEF>>>\n"
-        f"{want_def}, one per line, no bullet characters. Each MUST be a complete "
-        "sentence that begins with the term being defined, in this style:\n"
-        "Thyroglobulin is a large glycoprotein that acts as the scaffold for thyroid "
-        "hormone synthesis and storage.\n"
-        "Do not use dashes, colons, or bold markers to separate the term from its "
-        "definition, and do not use any markdown formatting.\n"
-        "<<<CLIN>>>\n"
-        "1 to 3 sentences on clinical relevance, or the single word NONE.\n\n"
-        + style
-    )
-
-
-def prompt_revision(text: str, violations: Sequence[Violation], style: str,
-                    has_markers: bool) -> str:
-    listed = "\n\n".join(v.render() for v in violations[:14])
-    marker_rule = (
-        "\nThe text contains figure anchors of the form [[FIG:xxx]]. Reproduce every "
-        "one of them, unchanged, on its own line, in the same relative position.\n"
-        if has_markers else "")
-    return (
-        "Revise the passage below so that it obeys the writing rules. The passage is "
-        "otherwise correct: keep the same facts, the same order of ideas and "
-        "approximately the same length. Change only what the rules require.\n\n"
-        "=== PASSAGE ===\n" + text + "\n=== END PASSAGE ===\n\n"
-        "=== PROBLEMS FOUND ===\n" + listed + "\n=== END PROBLEMS ===\n\n"
-        + style + marker_rule +
-        "\nWhere a sentence points backwards with a pronoun, resolve it to the name it "
-        "refers to. Where a modifier is stranded, pull its noun in. Where causation is "
-        "stated as a noun, restate it with a causal verb and lead with the cause.\n\n"
-        "Output the revised passage and nothing else. Do not comment on the changes."
-    )
-
-
-def prompt_summary(outline: "Outline", sections: Sequence["WrittenSection"],
-                   style: str = "") -> str:
-    digest = "\n\n".join(
-        f"## {s.heading}\n" + " ".join(s.content.split())[:700] for s in sections
-    )
-    return (
-        f"Document: {outline.title}\n\n"
-        "Here is a digest of the finished document:\n\n" + digest + "\n\n"
-        "Write a closing synthesis of 120-180 words that ties the material together: "
-        "the through-line of the topic, how the pieces relate, and what a student should "
-        "retain. Prose only, no headings, no bullet list.\n\n" + style
-    )
-
-
-# --------------------------------------------------------------------------
-# Plan / result structures
-# --------------------------------------------------------------------------
-
-@dataclass
-class PlannedSection:
-    sid: str
-    heading: str
-    level: int
-    points: List[str]
-    weight: float
-    wants_definitions: bool = True
-    wants_clinical: bool = False
-    target_words: int = 300
-    figures: List[Figure] = field(default_factory=list)
-
-
-@dataclass
-class Outline:
-    title: str
-    topic: str
-    objectives: List[str]
-    sections: List[PlannedSection]
-
-
-@dataclass
-class WrittenSection:
-    sid: str
-    heading: str
-    level: int
-    content: str
-    key_points: List[str]
-    definitions: List[str]
-    clinical: str
-    figures: List[Figure]
-    failed: bool = False
-    planned_points: List[str] = field(default_factory=list)
-
-
-# --------------------------------------------------------------------------
-# Stage 2: outline
-# --------------------------------------------------------------------------
-
-def build_outline(client: LLMClient, doc: SourceDoc, target_words: int,
-                  max_chars: int) -> Outline:
-    raw = client.chat(
-        SYS_PLANNER,
-        prompt_outline(doc, target_words, max_chars),
-        max_tokens=MAXTOK_OUTLINE,
-        temperature=TEMP_OUTLINE,
-        tag="outline",
-    )
-    try:
-        data = extract_json(raw)
-    except ValueError:
-        log("outline JSON unparseable; falling back to source headings")
-        data = _fallback_outline(doc)
-
-    sections: List[PlannedSection] = []
-    for i, s in enumerate(data.get("sections") or []):
-        heading = str(s.get("heading") or "").strip()
-        if not heading:
-            continue
-        sections.append(PlannedSection(
-            sid=str(s.get("id") or f"s{i + 1}").strip(),
-            heading=heading,
-            level=int(s.get("level") or 2),
-            points=[str(p).strip() for p in (s.get("points") or []) if str(p).strip()],
-            weight=float(s.get("weight") or 3),
-            wants_definitions=bool(s.get("wants_definitions", True)),
-            wants_clinical=bool(s.get("wants_clinical", False)),
-        ))
-    if not sections:
-        data = _fallback_outline(doc)
-        sections = [
-            PlannedSection(sid=s["id"], heading=s["heading"], level=2,
-                           points=s["points"], weight=3)
-            for s in data["sections"]
-        ]
-
-    # deduplicate ids
-    seen: Dict[str, int] = {}
-    for s in sections:
-        if s.sid in seen:
-            seen[s.sid] += 1
-            s.sid = f"{s.sid}_{seen[s.sid]}"
-        else:
-            seen[s.sid] = 0
-
-    total_weight = sum(s.weight for s in sections) or 1.0
-    for s in sections:
-        raw_target = target_words * (s.weight / total_weight)
-        s.target_words = int(max(MIN_SECTION_WORDS, min(MAX_SECTION_WORDS, raw_target)))
-
-    outline = Outline(
-        title=clean_inline_md(str(data.get("title") or doc.title_guess)),
-        topic=clean_inline_md(str(data.get("topic") or "")),
-        objectives=[clean_inline_md(str(o)) for o in (data.get("objectives") or [])
-                    if str(o).strip()],
-        sections=sections,
-    )
-    log(f"outline: {len(sections)} sections, "
-        f"{sum(s.target_words for s in sections)} planned words")
-    return outline
-
-
-def _fallback_outline(doc: SourceDoc) -> Dict[str, Any]:
-    heads: List[str] = []
-    for h in doc.headings:
-        if h and h.lower() not in {x.lower() for x in heads}:
-            heads.append(h)
-    heads = heads[:10] or ["Overview"]
-    return {
-        "title": doc.title_guess,
-        "topic": doc.title_guess,
-        "objectives": [],
-        "sections": [
-            {"id": f"s{i + 1}", "heading": h.title(), "points": [h], "weight": 3}
-            for i, h in enumerate(heads)
-        ],
-    }
-
-
-# --------------------------------------------------------------------------
-# Stage 3: figure captions
-# --------------------------------------------------------------------------
-
-def write_captions(client: LLMClient, doc: SourceDoc, title: str, workers: int,
-                   keep_emphasis: bool = False, audit: bool = True) -> None:
-    def one(fig: Figure) -> None:
-        try:
-            raw = client.chat(
-                SYS_CAPTIONER,
-                prompt_caption(fig, title),
-                max_tokens=MAXTOK_CAPTION,
-                temperature=TEMP_CAPTION,
-                tag=f"caption:{fig.fid}",
-            )
-            parts = split_delims(raw, ["CAP", "DESC", "FACTS"])
-            cap = " ".join(parts["CAP"].split()).strip()
-            desc = parts["DESC"].strip()
-            facts = [f for f in bulletize(parts["FACTS"], limit=20,
-                                          keep_emphasis=keep_emphasis)
-                     if f.strip().upper().rstrip(".") != "NONE"]
-        except Exception as exc:                          # noqa: BLE001
-            log(f"caption failed for {fig.fid} ({exc}); using raw description")
-            cap, desc, facts = "", "", []
-        if not desc:
-            desc = fig.raw
-        if not cap:
-            cap = _first_sentence(fig.raw)
-
-        # Deterministic backstop for the model's split. Any sentence left in the
-        # description that carries no visual cue is content, so it moves to the
-        # facts bucket where the section writer will pick it up.
-        if audit:
-            visual, content = visual_split(desc)
-            if visual and content:
-                log(f"desc audit {fig.fid}: moved {len(content)} non-visual "
-                    f"sentence(s) into <con>")
-                desc = " ".join(visual)
-                facts.extend(content)
-            elif not visual:
-                log(f"desc audit {fig.fid}: no visual sentences found, "
-                    f"keeping description unchanged")
-
-        # Figure text follows the same markdown policy as the rest of the
-        # document; stripping emphasis changes no content.
-        fig.caption = clean_inline_md(cap, keep_emphasis)
-        fig.description = clean_inline_md(desc, keep_emphasis)
-        fig.facts = _dedupe_facts(clean_inline_md(f, keep_emphasis) for f in facts)
-
-    _run_parallel(one, doc.figures, workers, "captions")
-    total = sum(len(f.facts) for f in doc.figures)
-    log(f"captions: extracted {total} content claim(s) out of the figure text")
-
-
-def _dedupe_facts(facts: Iterable[str]) -> List[str]:
-    seen: set = set()
-    out: List[str] = []
-    for f in facts:
-        f = f.strip()
-        key = re.sub(r"[^a-z0-9 ]", "", f.lower())
-        if len(f.split()) < 4 or key in seen:
-            continue
-        seen.add(key)
-        out.append(f)
-    return out
-
-
-def _first_sentence(text: str) -> str:
-    flat = " ".join(text.split())
-    m = re.match(r"(.{0,240}?[.!?])(\s|$)", flat)
-    return (m.group(1) if m else flat[:200]).strip()
-
-
-# --------------------------------------------------------------------------
-# Stage 4: figure placement
-# --------------------------------------------------------------------------
-
-def place_figures(client: LLMClient, outline: Outline, doc: SourceDoc,
-                  max_per_section: int = MAX_FIGS_PER_SECTION) -> None:
-    valid = {s.sid for s in outline.sections}
-    assignment: Dict[str, str] = {}
-
-    if doc.figures:
-        try:
-            raw = client.chat(
-                SYS_PLANNER,
-                prompt_placement(outline, doc.figures),
-                max_tokens=MAXTOK_PLACEMENT,
-                temperature=TEMP_PLACEMENT,
-                tag="placement",
-            )
-            data = extract_json(raw)
-            if isinstance(data, dict):
-                data = data.get("assignments") or data.get("placements") or []
-            for item in data or []:
-                if not isinstance(item, dict):
-                    continue
-                fid = str(item.get("fid") or item.get("figure") or "").strip()
-                sid = str(item.get("sid") or item.get("section") or "").strip()
-                if fid and sid in valid:
-                    assignment[fid] = sid
-        except Exception as exc:                          # noqa: BLE001
-            log(f"placement call unusable ({exc}); using lexical fallback for all figures")
-
-    # Lexical fallback for anything the model missed or mis-assigned.
-    ranker = Retriever([SourceBlock(heading=s.heading,
-                                    text=s.heading + " " + " ".join(s.points))
-                        for s in outline.sections])
-    for fig in doc.figures:
-        sid = assignment.get(fig.fid)
-        if sid not in valid:
-            sid = _best_section(ranker, outline, fig)
-            log(f"figure {fig.fid} -> {sid} (lexical fallback)")
-        fig.section_id = sid
-
-    by_sid = {s.sid: s for s in outline.sections}
-    for fig in sorted(doc.figures, key=lambda f: f.order):
-        by_sid[fig.section_id].figures.append(fig)
-
-    _rebalance(ranker, outline, max_per_section)
-
-    log("figure placement: " + ", ".join(
-        f"{s.sid}={len(s.figures)}" for s in outline.sections if s.figures))
-
-
-def _rebalance(ranker: Retriever, outline: Outline, max_per_section: int) -> None:
-    """Move overflow figures out of crowded sections.
-
-    A section carrying a dozen figures produces a prompt with a dozen
-    [[FIG:]] markers to thread through the prose, which measurably degrades
-    the section's own text. Overflow goes to the next-best-scoring section
-    that still has room.
-    """
-    if max_per_section <= 0:
-        return
-    for sec in outline.sections:
-        if len(sec.figures) <= max_per_section:
-            continue
-        scored = sorted(
-            sec.figures,
-            key=lambda f: ranker.score(tokenize(f.caption + " " + f.raw),
-                                       ranker.docs[_index_of(outline, sec.sid)]),
-            reverse=True,
-        )
-        sec.figures = scored[:max_per_section]
-        for fig in scored[max_per_section:]:
-            target = _next_best(ranker, outline, fig, exclude=sec.sid,
-                                max_per_section=max_per_section)
-            fig.section_id = target.sid
-            target.figures.append(fig)
-            log(f"figure {fig.fid} moved {sec.sid} -> {target.sid} (crowding)")
-    for sec in outline.sections:
-        sec.figures.sort(key=lambda f: f.order)
-
-
-def _index_of(outline: Outline, sid: str) -> int:
-    for i, s in enumerate(outline.sections):
-        if s.sid == sid:
-            return i
-    return 0
-
-
-def _next_best(ranker: Retriever, outline: Outline, fig: Figure, exclude: str,
-               max_per_section: int) -> PlannedSection:
-    query = tokenize(fig.caption + " " + fig.raw)
-    ranked = sorted(
-        range(len(outline.sections)),
-        key=lambda i: ranker.score(query, ranker.docs[i]),
-        reverse=True,
-    )
-    for i in ranked:
-        cand = outline.sections[i]
-        if cand.sid != exclude and len(cand.figures) < max_per_section:
-            return cand
-    for i in ranked:
-        if outline.sections[i].sid != exclude:
-            return outline.sections[i]
-    return outline.sections[0]
-
-
-def _best_section(ranker: Retriever, outline: Outline, fig: Figure) -> str:
-    query = tokenize(fig.caption + " " + fig.raw)
-    best_i, best_s = 0, -1.0
-    for i, dtoks in enumerate(ranker.docs):
-        s = ranker.score(query, dtoks)
-        if s > best_s:
-            best_i, best_s = i, s
-    return outline.sections[best_i].sid
-
-
-# --------------------------------------------------------------------------
-# Stage 5: section writing
-# --------------------------------------------------------------------------
-
-def _salvage_from_thinking(thinking: str, target_words: int) -> str:
-    """Recover prose that the model drafted inside its reasoning block."""
-    if not thinking:
-        return ""
-    paras = [p.strip() for p in re.split(r"\n\s*\n", thinking) if p.strip()]
-    # Keep the tail: reasoning models plan first and draft last.
-    keep: List[str] = []
-    for p in reversed(paras):
-        if re.match(r"^(okay|ok|let me|i need to|first,|so,|now i|the user|hmm)", p,
-                    re.I):
-            continue
-        if len(p.split()) < 25:
-            continue
-        keep.insert(0, p)
-        if sum(len(x.split()) for x in keep) >= target_words * 0.8:
-            break
-    return "\n\n".join(keep).strip()
-
-
-def revise_prose(client: LLMClient, text: str, linter: ProseLinter, style: str,
-                 max_rounds: int, budget: int, tag: str) -> Tuple[str, List[Violation]]:
-    """Iteratively repair style violations, never at the cost of content.
-
-    A revision is rejected outright if it drops a figure anchor or loses more
-    than a quarter of the text -- a cleaner passage that has silently shed a
-    figure or a paragraph is a worse outcome than a passage with violations.
-    """
-    best = text
-    best_v = linter.lint(text)
-    if not best_v or max_rounds <= 0:
-        return best, best_v
-
-    markers = set(FIG_MARKER_RE.findall(text))
-    for rnd in range(1, max_rounds + 1):
-        try:
-            cand = client.chat(
-                SYS_EDUCATOR,
-                prompt_revision(best, best_v, style, bool(markers)),
-                max_tokens=budget,
-                temperature=0.3,
-                tag=f"{tag}.revise{rnd}",
-            )
-        except Exception as exc:                          # noqa: BLE001
-            log(f"revision {tag} round {rnd} errored: {exc}")
-            break
-        cand = _strip_stray_headings(clean_inline_md(cand, keep_emphasis=True))
-        if not cand:
-            break
-        if set(FIG_MARKER_RE.findall(cand)) != markers:
-            log(f"revision {tag} round {rnd} rejected: figure anchors changed")
-            break
-        if word_count(cand) < word_count(best) * 0.75:
-            log(f"revision {tag} round {rnd} rejected: lost "
-                f"{word_count(best) - word_count(cand)} words")
-            break
-        cand_v = linter.lint(cand)
-        if len(cand_v) >= len(best_v):
-            log(f"revision {tag} round {rnd}: no improvement "
-                f"({len(best_v)} -> {len(cand_v)}), keeping previous")
-            break
-        log(f"revision {tag} round {rnd}: violations {len(best_v)} -> {len(cand_v)}")
-        best, best_v = cand, cand_v
-        if not best_v:
-            break
-    return best, best_v
-
-
-def write_sections(client: LLMClient, outline: Outline, doc: SourceDoc,
-                   workers: int, keep_emphasis: bool, tok_override: int,
-                   failures: List[str], linter: ProseLinter, style: str,
-                   max_revisions: int,
-                   lint_log: Optional[List[Tuple[str, List[Violation]]]] = None,
-                   ) -> List[WrittenSection]:
-    retriever = Retriever(doc.blocks)
-    results: Dict[str, WrittenSection] = {}
-
-    def get_prose(sec: PlannedSection, excerpts: Sequence[SourceBlock]) -> str:
-        budget = section_token_budget(sec.target_words, tok_override)
-        floor = max(60, int(sec.target_words * MIN_CONTENT_RATIO))
-        thinking = ""
-
-        for attempt in (1, 2):
-            try:
-                content, thinking = client.chat_full(
-                    SYS_EDUCATOR,
-                    prompt_section_prose(outline, sec, excerpts, sec.figures,
-                                         sec.target_words, insist=(attempt == 2),
-                                         style=style),
-                    max_tokens=budget if attempt == 1 else int(budget * 1.4),
-                    temperature=TEMP_SECTION if attempt == 1 else 0.7,
-                    tag=f"section:{sec.sid}" + ("" if attempt == 1 else ".retry"),
-                )
-            except Exception as exc:                      # noqa: BLE001
-                log(f"section {sec.sid} attempt {attempt} errored: {exc}")
-                continue
-
-            content = _strip_stray_headings(content)
-            if word_count(content) >= floor:
-                return content
-            log(f"section {sec.sid} attempt {attempt}: only "
-                f"{word_count(content)} words (floor {floor}); retrying")
-
-        salvaged = _salvage_from_thinking(thinking, sec.target_words)
-        if word_count(salvaged) >= floor:
-            log(f"section {sec.sid}: recovered {word_count(salvaged)} words "
-                f"from the reasoning block")
-            return _strip_stray_headings(salvaged)
-        return ""
-
-    def one(sec: PlannedSection) -> None:
-        query = sec.heading + " " + " ".join(sec.points)
-        excerpts = retriever.top(query, k=10, char_budget=7000)
-
-        content = get_prose(sec, excerpts)
-        if content:
-            content, viol = revise_prose(
-                client, content, linter, style, max_revisions,
-                section_token_budget(sec.target_words, tok_override),
-                f"section:{sec.sid}")
-            if lint_log is not None:
-                lint_log.append((f"{sec.sid} ({sec.heading})", viol))
-        failed = not content
-        if failed:
-            failures.append(f"{sec.sid} ({sec.heading})")
-            log(f"section {sec.sid}: FAILED to generate prose")
-
-        key: List[str] = []
-        defs: List[str] = []
-        clin = ""
-        if content:
-            try:
-                raw = client.chat(
-                    SYS_EDUCATOR,
-                    prompt_section_extras(sec, content, style),
-                    max_tokens=MAXTOK_EXTRAS,
-                    temperature=TEMP_EXTRAS,
-                    tag=f"extras:{sec.sid}",
-                )
-                parts = split_delims(raw, ["KEY", "DEF", "CLIN"])
-                key = bulletize(parts["KEY"], limit=6, keep_emphasis=keep_emphasis)
-                if lint_log is not None:
-                    extras_v = linter.lint(" ".join(key + [parts["CLIN"]]))
-                    if extras_v:
-                        lint_log.append((f"{sec.sid} extras", extras_v))
-                defs = [normalize_definition(d, keep_emphasis)
-                        for d in bulletize(parts["DEF"], limit=5, keep_emphasis=True)]
-                defs = [d for d in defs if len(d.split()) >= 4]
-                clin = clean_inline_md(" ".join(parts["CLIN"].split()), keep_emphasis)
-                if clin.strip().upper().rstrip(".") == "NONE":
-                    clin = ""
-            except Exception as exc:                      # noqa: BLE001
-                log(f"extras for {sec.sid} failed: {exc}")
-
-        results[sec.sid] = WrittenSection(
-            sid=sec.sid,
-            heading=clean_inline_md(sec.heading, keep_emphasis),
-            level=sec.level,
-            content=clean_inline_md(content, keep_emphasis) if content else "",
-            key_points=key,
-            definitions=defs,
-            clinical=clin,
-            figures=list(sec.figures),
-            failed=failed,
-            planned_points=list(sec.points),
-        )
-
-    _run_parallel(one, outline.sections, workers, "sections")
-    return [results[s.sid] for s in outline.sections if s.sid in results]
-
-
-def _strip_stray_headings(text: str) -> str:
-    """The model is told not to emit a heading; remove one if it did anyway."""
-    lines = text.splitlines()
-    while lines and (not lines[0].strip() or HEADING_RE.match(lines[0].strip())):
-        if lines[0].strip() and HEADING_RE.match(lines[0].strip()):
-            lines.pop(0)
-            continue
-        if not lines[0].strip():
-            lines.pop(0)
-            continue
-        break
-    return "\n".join(lines).strip()
-
-
-# --------------------------------------------------------------------------
-# Parallel helper
-# --------------------------------------------------------------------------
 
 def _run_parallel(fn, items: Sequence[Any], workers: int, label: str) -> None:
+    """Apply fn to every item, on a thread pool when workers exceeds one.
+
+    Exceptions propagate from the first future that raised, so a genuine
+    failure is not hidden by concurrency.
+    """
     items = list(items)
     if not items:
         return
@@ -2000,134 +1144,275 @@ def _run_parallel(fn, items: Sequence[Any], workers: int, label: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Stage 7: rendering
+# Stage 3: metadata
 # --------------------------------------------------------------------------
 
-def render_figure(fig: Figure) -> str:
-    cap = " ".join((fig.caption or "").split()) or "Figure."
-    desc = (fig.description or fig.raw).strip()
+SYS_ANALYST = (
+    "You read chapters of a medical textbook and answer with plain text only. "
+    "No preamble, no markdown headings, no bullet markers, no commentary on "
+    "the question. Answer with the requested text and nothing else."
+)
+
+
+def _chapter_digest(doc: SourceDoc, max_chars: int = 6000) -> str:
+    """A compact view of the chapter for the metadata prompts."""
+    parts = [f"TITLE: {doc.title}"]
+    for section in doc.sections:
+        parts.append(f"\n## {section.heading}")
+        for element in section.elements:
+            if element.kind == "para":
+                parts.append(element.text)
+                break
+    digest = "\n".join(parts)
+    return digest[:max_chars]
+
+
+def prompt_topic(doc: SourceDoc) -> str:
+    """Build the prompt asking for the chapter's one-line subject statement."""
     return (
-        f'<fig id="{fig.fid}">\n'
-        f"[FIGURE:{fig.fid}]\n"
-        f"<cap>{cap}</cap>\n"
-        f"<desc>\n{desc}\n</desc>\n"
-        f"</fig>"
+        "Below is a digest of one chapter of a medical textbook.\n\n"
+        f"{_chapter_digest(doc)}\n\n"
+        "Write ONE sentence, at most 30 words, stating what this chapter is "
+        "about. Name the actual subject matter, not the fact that it is a "
+        "chapter. Do not begin with 'This chapter'. Output the sentence only."
     )
 
 
-def render_section(sec: WrittenSection) -> str:
-    out: List[str] = [f'<sec id="{sec.sid}" level="{sec.level}">',
-                      f"<head>{sec.heading}</head>", ""]
+def prompt_objectives(doc: SourceDoc) -> str:
+    """Build the prompt used only when a chapter has no OBJECTIVES section."""
+    return (
+        "Below is a digest of one chapter of a medical textbook.\n\n"
+        f"{_chapter_digest(doc)}\n\n"
+        "Write 5 to 8 learning objectives for this chapter, one per line. "
+        "Each begins with a verb and states something a reader should be able "
+        "to do after studying the chapter. No numbering, no bullet markers."
+    )
 
-    if sec.failed:
-        out.append('<note status="failed">')
-        out.append("This section could not be generated. Planned coverage: "
-                   + "; ".join(sec.planned_points) + ".")
-        out.append("</note>")
+
+def prompt_summary(doc: SourceDoc) -> str:
+    """Build the prompt used only when a chapter has no SUMMARY section."""
+    return (
+        "Below is a digest of one chapter of a medical textbook.\n\n"
+        f"{_chapter_digest(doc)}\n\n"
+        "Write 5 to 8 summary points for this chapter, one per line. Each is "
+        "a complete sentence stating a substantive conclusion from the "
+        "chapter. No numbering, no bullet markers."
+    )
+
+
+def prompt_caption(fig: Figure, doc: SourceDoc) -> str:
+    """Build the prompt for captioning a figure the source left uncaptioned."""
+    return (
+        f"In a chapter titled '{doc.title}', a figure labelled "
+        f"'{fig.label or 'an unnumbered diagram'}' appears with no caption.\n\n"
+        f"What the extractor recorded about the image:\n{fig.alt_text or fig.extra}\n\n"
+        "Write ONE sentence, at most 25 words, that could serve as its "
+        "caption. Describe only what the recorded text supports; invent "
+        "nothing. Output the sentence only."
+    )
+
+
+def build_metadata(client: LLMClient, doc: SourceDoc, want_summary: bool) -> str:
+    """Fill the metadata the source does not supply. Returns the topic line.
+
+    Objectives, summary and glossary come from the chapter itself whenever it
+    has them, which on this corpus is always; the model is called only for
+    <topic>, which has no source counterpart, and to fill a genuine gap.
+    """
+    topic = client.chat(SYS_ANALYST, prompt_topic(doc),
+                        max_tokens=MAXTOK_TOPIC, temperature=TEMP_TOPIC,
+                        tag="topic").strip()
+    topic = clean_heading(topic).split("\n")[0]
+
+    if not doc.objectives:
+        log("no OBJECTIVES section in source; inferring")
+        raw = client.chat(SYS_ANALYST, prompt_objectives(doc),
+                          max_tokens=MAXTOK_OBJECTIVES,
+                          temperature=TEMP_OBJECTIVES, tag="objectives")
+        doc.objectives = _list_items(raw)
+
+    if want_summary and not doc.summary:
+        log("no SUMMARY section in source; inferring")
+        raw = client.chat(SYS_ANALYST, prompt_summary(doc),
+                          max_tokens=MAXTOK_SUMMARY, temperature=TEMP_SUMMARY,
+                          tag="summary")
+        doc.summary = _list_items(raw)
+
+    return topic or doc.title
+
+
+def fill_missing_captions(client: LLMClient, doc: SourceDoc, workers: int) -> None:
+    """Caption the figures the source left uncaptioned.
+
+    A numbered figure almost always carries its caption in the source. The
+    unnumbered inline diagrams do not, and those are the ones this reaches.
+    """
+    todo = [f for f in doc.figures if not f.caption and (f.alt_text or f.extra)]
+    if not todo:
+        return
+
+    def one(fig: Figure) -> None:
+        """Caption a single figure, logging and skipping on backend failure."""
+        try:
+            text = client.chat(SYS_ANALYST, prompt_caption(fig, doc),
+                               max_tokens=MAXTOK_CAPTION,
+                               temperature=TEMP_CAPTION, tag=f"caption:{fig.fid}")
+        except LLMError as exc:                           # noqa: BLE001
+            log(f"caption failed for {fig.fid}: {exc}")
+            return
+        fig.caption = clean_heading(text).split("\n")[0]
+
+    _run_parallel(one, todo, workers, "captions")
+
+
+# --------------------------------------------------------------------------
+# Stage 4: cross-reference linking
+# --------------------------------------------------------------------------
+
+MENTION_RE = re.compile(
+    r"\b(Figure|Figures|Table|Tables)\s+(\d+)\s*[–—-]\s*(\d+)([A-Z])?\b")
+
+
+def link_references(text: str, known: Dict[str, str]) -> str:
+    """Wrap in-document figure and table mentions in a reference tag.
+
+    The mention text is kept and wrapped rather than replaced, so stripping the
+    tags restores the source sentence exactly. Mentions that resolve to nothing
+    in this chapter -- 'see Figure 40-5', which points at another chapter --
+    are left alone, because there is no target to point at.
+    """
+    def replace(m: "re.Match[str]") -> str:
+        """Wrap one mention, or return it untouched when it does not resolve."""
+        kind = "fig" if m.group(1).lower().startswith("figure") else "tbl"
+        ref_id = f"{kind}-{m.group(2)}-{m.group(3)}"
+        if known.get(ref_id) != kind:
+            return m.group(0)
+        tag = "figref" if kind == "fig" else "tblref"
+        return f'<{tag} id="{escape_attr(ref_id)}">{m.group(0)}</{tag}>'
+
+    return MENTION_RE.sub(replace, text)
+
+
+def reference_index(doc: SourceDoc) -> Dict[str, str]:
+    """Map every figure and table id in this document to its kind."""
+    index = {f.fid: "fig" for f in doc.figures}
+    index.update({t.tid: "tbl" for t in doc.tables})
+    return index
+
+
+# --------------------------------------------------------------------------
+# Stage 5: rendering
+# --------------------------------------------------------------------------
+
+def _caption(text: str, known: Dict[str, str]) -> str:
+    """Flatten a caption to one line and link its cross-references."""
+    return link_references(re.sub(r"\s+", " ", text).strip(), known)
+
+
+def render_figure(fig: Figure, known: Dict[str, str]) -> str:
+    """Render one <fig>. ``known`` links cross-references inside the caption."""
+    attrs = f'id="{escape_attr(fig.fid)}"'
+    if fig.label:
+        attrs += f' label="{escape_attr(fig.label)}"'
+    if fig.panel:
+        attrs += f' panel="{escape_attr(fig.panel)}"'
+    if fig.image_src:
+        attrs += f' src="{escape_attr(fig.image_src)}"'
+    out = [f"<fig {attrs}>"]
+    out.append(f"<cap>{_caption(fig.caption, known)}</cap>")
+    out.append("<desc></desc>")
+    if fig.extra:
         out.append("")
+        out.append(fig.extra)
+    out.append("</fig>")
+    return "\n".join(out)
 
-    by_id = {f.fid: f for f in sec.figures}
-    placed: List[str] = []
 
-    # Split the prose at [[FIG:id]] anchors so figures land in the flow.
-    pieces = FIG_MARKER_RE.split(sec.content)
-    # split() with one capture group yields: text, fid, text, fid, text...
-    chunk_texts = pieces[0::2]
-    chunk_fids = pieces[1::2]
+def render_table(tbl: Table, known: Dict[str, str]) -> str:
+    """Render one <tbl>. ``known`` links cross-references inside the caption."""
+    attrs = f'id="{escape_attr(tbl.tid)}"'
+    if tbl.label:
+        attrs += f' label="{escape_attr(tbl.label)}"'
+    out = [f"<tbl {attrs}>"]
+    out.append(f"<cap>{_caption(tbl.caption, known)}</cap>")
+    if tbl.body:
+        out.append(tbl.body)
+    out.append("</tbl>")
+    return "\n".join(out)
 
-    for i, text in enumerate(chunk_texts):
-        text = text.strip()
-        if text:
+
+def render_section(section: Section, known: Dict[str, str]) -> str:
+    """Render one <sec>, walking its elements in source order."""
+    out = [f'<sec id="{escape_attr(section.sid)}" level="{section.level}">',
+           f"<head>{clean_heading(section.heading)}</head>", ""]
+    for element in section.elements:
+        if element.kind == "para":
             out.append("<con>")
-            out.append(text)
+            out.append(link_references(element.text, known))
             out.append("</con>")
-            out.append("")
-        if i < len(chunk_fids):
-            fid = chunk_fids[i].strip()
-            if fid in by_id and fid not in placed:
-                out.append(render_figure(by_id[fid]))
-                out.append("")
-                placed.append(fid)
-
-    # Any figure the model failed to anchor goes after the prose.
-    for f in sec.figures:
-        if f.fid not in placed:
-            out.append(render_figure(f))
-            out.append("")
-            placed.append(f.fid)
-
-    if sec.key_points:
-        out.append("<key>")
-        out.extend(f"<pt>{k}</pt>" for k in sec.key_points)
-        out.append("</key>")
+        elif element.kind == "figure" and element.figure is not None:
+            out.append(render_figure(element.figure, known))
+        elif element.kind == "table" and element.table is not None:
+            out.append(render_table(element.table, known))
         out.append("")
-    if sec.definitions:
+    out.append("</sec>")
+    return "\n".join(out)
+
+
+def render_document(doc: SourceDoc, topic: str, model: str,
+                    want_summary: bool) -> str:
+    """Assemble the whole tagged document.
+
+    ``model`` is recorded in <src> for provenance, and ``want_summary``
+    suppresses the <sum> block when --no-summary was given.
+    """
+    known = reference_index(doc)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    src = (f"source: {os.path.basename(doc.path)}"
+           f" | book: {doc.book}" if doc.book else
+           f"source: {os.path.basename(doc.path)}")
+    src += (f" | figures: {len(doc.figures)} | tables: {len(doc.tables)}"
+            f" | model: {model} | generated: {stamp}")
+
+    out: List[str] = ["<doc>", "", "<meta>",
+                      f"<title>{doc.title}</title>",
+                      f"<topic>{topic}</topic>",
+                      f"<src>{src}</src>",
+                      "</meta>", ""]
+
+    if doc.objectives:
+        out.append("<obj>")
+        for goal in doc.objectives:
+            out.append(f"<goal>{goal}</goal>")
+        out.append("</obj>")
+        out.append("")
+
+    for section in doc.sections:
+        out.append(render_section(section, known))
+        out.append("")
+
+    if want_summary and doc.summary:
+        out.append("<sum>")
+        out.extend(doc.summary)
+        out.append("</sum>")
+        out.append("")
+
+    if doc.glossary:
         out.append("<def>")
-        out.extend(f"<term>{d}</term>" for d in sec.definitions)
+        for entry in doc.glossary:
+            out.append(f"<term>{normalize_definition(entry, keep_emphasis=True)}</term>")
         out.append("</def>")
         out.append("")
-    if sec.clinical:
-        out.append("<clin>")
-        out.append(sec.clinical)
-        out.append("</clin>")
-        out.append("")
-
-    out.append("</sec>")
-    return "\n".join(out).replace("\n\n\n", "\n\n")
-
-
-def render_document(outline: Outline, sections: Sequence[WrittenSection],
-                    doc: SourceDoc, summary: str, model: str,
-                    orphans: Sequence[Figure]) -> str:
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    parts: List[str] = ["<doc>", ""]
-
-    parts += [
-        "<meta>",
-        f"<title>{outline.title}</title>",
-        f"<topic>{outline.topic}</topic>",
-        f"<src>source: {os.path.basename(doc.path)} | figures: {len(doc.figures)} | "
-        f"model: {model} | generated: {stamp}</src>",
-        "</meta>",
-        "",
-    ]
-
-    if outline.objectives:
-        parts.append("<obj>")
-        parts.extend(f"<goal>{o}</goal>" for o in outline.objectives)
-        parts.append("</obj>")
-        parts.append("")
-
-    for sec in sections:
-        parts.append(render_section(sec))
-        parts.append("")
-
-    if orphans:
-        parts.append('<sec id="figures-appendix" level="2">')
-        parts.append("<head>Additional Figures</head>")
-        parts.append("")
-        parts.append("<con>")
-        parts.append("Figures from the source material that did not attach to a "
-                     "specific section above are collected here for completeness.")
-        parts.append("</con>")
-        parts.append("")
-        for f in orphans:
-            parts.append(render_figure(f))
-            parts.append("")
-        parts.append("</sec>")
-        parts.append("")
-
-    if summary:
-        parts += ["<sum>", summary.strip(), "</sum>", ""]
 
     if doc.references:
-        parts.append("<ref>")
-        parts.extend(f"<cit>{r}</cit>" for r in doc.references)
-        parts.append("</ref>")
-        parts.append("")
+        out.append("<ref>")
+        for cit in doc.references:
+            out.append(f"<cit>{cit}</cit>")
+        out.append("</ref>")
+        out.append("")
 
-    parts.append("</doc>")
-    text = "\n".join(parts)
+    out.append("</doc>")
+    text = "\n".join(out)
     return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
 
@@ -2135,65 +1420,83 @@ def render_document(outline: Outline, sections: Sequence[WrittenSection],
 # Verification
 # --------------------------------------------------------------------------
 
-def _unused_facts(doc: SourceDoc, sections: Sequence[WrittenSection]) -> List[str]:
-    """Claims pulled out of figure descriptions that never reached the prose.
+# Dispositions that legitimately produce no <con> of their own, each for a
+# reason that was decided rather than defaulted. A disposition missing from
+# both this set and EMITTED_DISPOSITIONS is a bug, and verify says so.
+SILENT_DISPOSITIONS = {
+    "heading",        # becomes <head>, or selects a fixed-section collector
+    "book",           # recorded in <src>
+    "author",         # attribution already carried by the book line
+    "credit",         # repeated per-figure copyright boilerplate
+    "figure-alt",     # would populate <desc>, which is empty for now
+    "figure-head", "figure-image", "figure-detail",
+    "table-head", "table-body",
+}
 
-    Moving content from <desc> into <con> only works if the section writer
-    actually uses it, so anything dropped on the floor is reported rather than
-    silently lost.
-    """
-    prose = " ".join(s.content for s in sections).lower()
-    prose_tokens = set(tokenize(prose))
-    missing: List[str] = []
-    for fig in doc.figures:
-        for fact in fig.facts:
-            toks = set(tokenize(fact))
-            if not toks:
-                continue
-            overlap = len(toks & prose_tokens) / len(toks)
-            if overlap < 0.5:
-                missing.append(f"{fig.fid}: {fact}")
-    return missing
+EMITTED_DISPOSITIONS = {
+    "content", "caption", "objectives", "summary", "glossary", "references",
+}
+
+_TAG_RE = re.compile(r"</?[a-z][a-z0-9]*(?:\s[^>]*)?/?>", re.I)
 
 
-def _write_lint_report(path: str, lint_log: Sequence[Tuple[str, List[Violation]]],
-                       orphan_facts: Sequence[str]) -> None:
-    lines: List[str] = ["STYLE LINT REPORT", "=" * 72, ""]
-    total = 0
-    for label, viols in lint_log:
-        if not viols:
-            continue
-        total += len(viols)
-        lines.append(f"## {label} -- {len(viols)} violation(s)")
-        lines.extend(v.render() for v in viols)
-        lines.append("")
-    lines.insert(2, f"residual violations: {total}")
-    if orphan_facts:
-        lines.append("## Claims removed from <desc> that never reached <con>")
-        lines.extend(f"  - {f}" for f in orphan_facts)
-        lines.append("")
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-    except OSError as exc:                                # noqa: BLE001
-        log(f"could not write lint report: {exc}")
+def _plain(text: str) -> str:
+    """Text with tags removed and whitespace collapsed, for comparison."""
+    return re.sub(r"\s+", " ", _TAG_RE.sub("", text)).strip()
 
 
 def verify(output: str, doc: SourceDoc) -> List[str]:
+    """Check that nothing was lost and that every reference resolves."""
     problems: List[str] = []
+    flat = _plain(output)
+
+    known_dispositions = SILENT_DISPOSITIONS | EMITTED_DISPOSITIONS
+    for block in doc.blocks:
+        if block.disposition not in known_dispositions:
+            problems.append(f"UNACCOUNTED source block ({block.disposition}): "
+                            f"{block.text[:100]!r}")
+
+    missing = 0
+    for block in doc.blocks:
+        if block.disposition != "content":
+            continue
+        if _plain(block.text) not in flat:
+            missing += 1
+            if missing <= 5:
+                problems.append(f"CONTENT LOST: {block.text[:100]!r}")
+    if missing > 5:
+        problems.append(f"CONTENT LOST: and {missing - 5} more paragraph(s)")
+
     for fig in doc.figures:
-        n = output.count(f"[FIGURE:{fig.fid}]")
-        if n == 0:
-            problems.append(f"MISSING figure marker: {fig.fid}")
-        elif n > 1:
-            problems.append(f"DUPLICATED figure marker ({n}x): {fig.fid}")
-    for tag in ("doc", "meta", "ref"):
+        n = output.count(f'<fig id="{fig.fid}"')
+        if n != 1:
+            problems.append(f"figure {fig.fid} defined {n} times, expected 1")
+    for tbl in doc.tables:
+        n = output.count(f'<tbl id="{tbl.tid}"')
+        if n != 1:
+            problems.append(f"table {tbl.tid} defined {n} times, expected 1")
+
+    known = reference_index(doc)
+    for ref_id in re.findall(r'<(?:fig|tbl)ref id="([^"]+)"', output):
+        if ref_id not in known:
+            problems.append(f"dangling reference: {ref_id}")
+
+    for tag in ("doc", "meta", "obj", "sum", "def", "ref"):
         if f"<{tag}>" in output and output.count(f"<{tag}>") != output.count(f"</{tag}>"):
             problems.append(f"unbalanced <{tag}> tags")
-    for tag in ("sec", "fig"):
+    for tag in ("sec", "fig", "tbl"):
         if output.count(f"<{tag} ") != output.count(f"</{tag}>"):
             problems.append(f"unbalanced <{tag}> tags")
+
     return problems
+
+
+def disposition_report(doc: SourceDoc) -> str:
+    """Summarise how many source blocks landed in each disposition."""
+    counts: Dict[str, int] = {}
+    for block in doc.blocks:
+        counts[block.disposition] = counts.get(block.disposition, 0) + 1
+    return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
 
 
 # --------------------------------------------------------------------------
@@ -2201,156 +1504,94 @@ def verify(output: str, doc: SourceDoc) -> List[str]:
 # --------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
-    doc = parse_source(args.input)
+    """Convert one file end to end.
 
-    if not doc.blocks:
-        sys.stderr.write("error: no prose content found in input\n")
+    Writes to args.output, or stdout when it is '-'. Returns 3 if the backend
+    is unreachable, 2 if the input yielded no content, 1 if verification
+    raised warnings, and 0 otherwise.
+    """
+    doc = parse_source(args.input)
+    if not doc.sections:
+        sys.stderr.write(f"error: no content found in {args.input}\n")
         return 2
 
-    linter = ProseLinter(vague_terms=args.vague_term)
-    style = STYLE_CONTRACT
-    if args.vague_term:
-        style += VAGUE_UMBRELLA_HINT.format(terms=", ".join(
-            f'"{t}"' for t in args.vague_term))
-
-    # Content claims migrate out of the figure descriptions into the prose, so
-    # the prose target has to grow to absorb them.
-    fig_words = sum(len(f.raw.split()) for f in doc.figures)
-    target = args.target_words or int(
-        (doc.prose_words + fig_words * args.figure_content_share) * args.length_scale)
-    target = max(600, target)
-    log(f"source prose: {doc.prose_words} words -> target: {target} words")
-
-    if args.dry_run:
-        client: LLMClient = DryRunClient(doc)
+    offline = args.offline or args.dry_run
+    if offline:
+        client: LLMClient = OfflineClient(doc)
+        model = "offline"
     else:
         client = LLMClient(
-            base_url=args.base_url,
-            model=args.model,
-            timeout=args.timeout,
-            retries=args.retries,
-            cache_dir=args.cache_dir,
+            base_url=args.base_url, model=args.model, timeout=args.timeout,
+            retries=args.retries, cache_dir=args.cache_dir,
             debug_dir=args.debug_dir,
         )
+        model = args.model
 
-    log("stage 1/5: outline")
-    outline = build_outline(client, doc, target, args.max_source_chars)
+    want_summary = not args.no_summary
 
-    log("stage 2/5: figure captions")
-    write_captions(client, doc, outline.title, args.workers,
-                   args.keep_emphasis, audit=not args.no_desc_audit)
+    log("stage 1/3  metadata")
+    try:
+        topic = build_metadata(client, doc, want_summary)
+    except LLMError as exc:                               # noqa: BLE001
+        # Refusing here rather than falling back keeps a misconfigured backend
+        # from quietly producing a document with degraded metadata.
+        sys.stderr.write(f"error: {exc}\n")
+        sys.stderr.write("hint: rerun with --offline to build the document "
+                         "without the backend\n")
+        return 3
 
-    log("stage 3/5: figure placement")
-    place_figures(client, outline, doc, args.max_figs_per_section)
+    log("stage 2/3  captions")
+    fill_missing_captions(client, doc, args.workers)
 
-    log("stage 4/5: section writing")
-    failures: List[str] = []
-    lint_log: List[Tuple[str, List[Violation]]] = []
-    sections = write_sections(client, outline, doc, args.workers,
-                              args.keep_emphasis, args.max_tokens_section, failures,
-                              linter, style, args.max_revisions, lint_log)
-
-    log("stage 5/5: summary")
-    summary = ""
-    if sections and not args.no_summary:
-        try:
-            summary = clean_inline_md(client.chat(
-                SYS_EDUCATOR, prompt_summary(outline, sections, style),
-                max_tokens=MAXTOK_SUMMARY, temperature=TEMP_SUMMARY, tag="summary",
-            ), args.keep_emphasis)
-        except Exception as exc:                          # noqa: BLE001
-            log(f"summary failed: {exc}")
-
-    rendered_ids = {f.fid for s in sections for f in s.figures}
-    orphans = [f for f in doc.figures if f.fid not in rendered_ids]
-
-    output = render_document(outline, sections, doc, summary, args.model, orphans)
+    log("stage 3/3  render")
+    output = render_document(doc, topic, model, want_summary)
 
     problems = verify(output, doc)
-    for f in failures:
-        problems.append(f"section produced no prose: {f}")
+    log("blocks: " + disposition_report(doc))
+    for problem in problems:
+        sys.stderr.write(f"warning: {problem}\n")
 
-    all_v = [v for _, vs in lint_log for v in vs]
-    if all_v:
-        log(f"residual style violations: {summarize_violations(all_v)}")
-    orphan_facts = _unused_facts(doc, sections)
-    if orphan_facts:
-        problems.append(
-            f"{len(orphan_facts)} claim(s) taken from figure descriptions do not "
-            f"appear in any section's prose")
-    if args.lint_report:
-        _write_lint_report(args.lint_report, lint_log, orphan_facts)
-        log(f"lint report written to {args.lint_report}")
-    for p in problems:
-        sys.stderr.write("warning: " + p + "\n")
-    if failures and not args.debug_dir:
-        sys.stderr.write(
-            "hint: rerun with --debug-dir DIR to capture the raw completions for "
-            "the failed sections, and consider --max-tokens-section 8192\n")
-
-    if args.output and args.output != "-":
+    if not args.output or args.output == "-":
+        sys.stdout.write(output)
+    else:
+        parent = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(parent, exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(output)
-        log(f"wrote {args.output}")
-        print(f"{args.output}: {word_count(output)} words, "
-              f"{len(doc.figures)} figures preserved, "
-              f"{len(problems)} warning(s)")
-    else:
-        sys.stdout.write(output)
+        print(f"wrote {args.output}  "
+              f"({len(doc.sections)} sections, {len(doc.figures)} figures, "
+              f"{len(doc.tables)} tables, {doc.content_words} content words, "
+              f"{len(problems)} warning(s))")
 
     return 1 if problems else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Construct the command-line parser."""
     p = argparse.ArgumentParser(
-        description="Rewrite slide-derived medical markdown into fresh tagged material.",
+        description="Convert medical textbook markdown into tagged study material.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"backend: {DEFAULT_BASE_URL}  model: {DEFAULT_MODEL} ({MODEL_REPO})",
     )
     p.add_argument("input", nargs="?", help="input markdown file")
-    p.add_argument("-o", "--output", default="-", help="output markdown file ('-' for stdout)")
+    p.add_argument("-o", "--output", default="-",
+                   help="output markdown file ('-' for stdout)")
     p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                   help="parallel LLM calls for captions and sections")
-    p.add_argument("--target-words", type=int, default=0,
-                   help="override the computed target length")
-    p.add_argument("--length-scale", type=float, default=1.0,
-                   help="multiplier on the source prose word count (default 1.0)")
-    p.add_argument("--max-source-chars", type=int, default=14000,
-                   help="how much source text to show the outline stage")
+                   help="parallel LLM calls when captions have to be inferred")
     p.add_argument("--cache-dir", default=None,
                    help="cache LLM responses here so reruns are cheap")
     p.add_argument("--debug-dir", default=None,
                    help="write every raw prompt+completion here for diagnosis")
-    p.add_argument("--max-figs-per-section", type=int, default=MAX_FIGS_PER_SECTION,
-                   help="overflow figures are moved to their next-best section "
-                        "(0 disables rebalancing)")
-    p.add_argument("--max-tokens-section", type=int, default=0,
-                   help="override the per-section token budget (default: scaled "
-                        "from the section's target length)")
-    p.add_argument("--keep-emphasis", action="store_true",
-                   help="keep inline **bold** / *italic* in generated text")
-    p.add_argument("--max-revisions", type=int, default=1,
-                   help="style-repair passes per section when the linter finds "
-                        "violations (0 disables revision)")
-    p.add_argument("--no-desc-audit", action="store_true",
-                   help="trust the model's <desc>/<con> split without the "
-                        "deterministic visual-sentence check")
-    p.add_argument("--vague-term", action="append", default=[], metavar="TERM",
-                   help="umbrella term that must not stand in for a specific "
-                        "molecule, e.g. --vague-term 'thyroid hormone' "
-                        "(repeatable)")
-    p.add_argument("--figure-content-share", type=float, default=0.35,
-                   help="fraction of figure-description words expected to migrate "
-                        "into the prose, used to size the length target")
-    p.add_argument("--lint-report", default=None,
-                   help="write a style violation report to this path")
-    p.add_argument("--no-summary", action="store_true")
+    p.add_argument("--offline", action="store_true",
+                   help="never call the model; derive <topic> from the title")
     p.add_argument("--dry-run", action="store_true",
-                   help="run the whole pipeline offline with stub completions")
+                   help="alias for --offline")
+    p.add_argument("--no-summary", action="store_true",
+                   help="omit the <sum> block")
     p.add_argument("--print-schema", action="store_true",
                    help="print the output tag vocabulary and exit")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -2358,6 +1599,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """Parse arguments and dispatch. Returns the process exit code."""
     global VERBOSE
     args = build_parser().parse_args(argv)
     VERBOSE = args.verbose

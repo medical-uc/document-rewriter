@@ -1,61 +1,92 @@
-Output tag vocabulary
-============================================================================
-TAG    PARENT     MEANING
-----------------------------------------------------------------------------
-<doc>  root       Wraps the entire generated document.
-<meta> doc        Document-level metadata block.
-<title>meta       Document title. Plain text, no '#' marker.
-<topic>meta       One-line statement of the subject matter.
-<src>  meta       Provenance: source filename, figure count, model, timestamp.
-<obj>  doc        Learning objectives.
-<goal> obj        One learning objective. One per element, no bullet marker.
-<sec>  doc        One section. Attributes: id, level.
-<head> sec        Section heading. Plain text; depth lives in sec/@level.
-<con>  sec        Narrative content prose. May occur several times per section when figures are interleaved into the flow.
-<fig>  sec / doc  A figure. Attribute: id. Always contains the literal [FIGURE:id] marker from the source, plus <cap> and <desc>.
-<cap>  fig        Short one-sentence caption for the figure.
-<desc> fig        Figure description, restricted to what a sighted reader would lose without the image: layout, colour, arrow direction, what is labelled where. Claims that stay true with the figure deleted are moved into <con>.
-<key>  sec        Key points for the section.
-<pt>   key        One key point. One per element, no bullet marker.
-<def>  sec        Terms introduced by the section.
-<term> def        One definition, phrased as a complete sentence that begins with the term (e.g. 'Thyroglobulin is a ...').
-<clin> sec        Clinical relevance or correlation note.
-<tbl>  sec        A table carried over or reconstructed from the source.
-<note> sec        Aside, caveat, or a machine-readable generation warning (attribute status="failed") when a section could not be written.
-<sum>  doc        Closing synthesis of the whole document.
-<ref>  doc        Reference list.
-<cit>  ref        A single citation.
+OUTPUT TAG VOCABULARY
 
-Markdown syntax policy
-----------------------
-The tags carry the document structure, so structural markdown is not emitted:
-  * <title> and <head> hold plain text -- no '#' or '##' markers. Heading depth
-    is expressed by the level attribute on <sec>.
-  * List items are elements (<goal>, <pt>, <term>, <cit>), not '- ' bullets.
-  * Inline emphasis (**bold**, *italic*) is stripped from generated text by
-    default. Pass --keep-emphasis to retain it.
-Prose style
------------
-Generated prose is held to a fixed style contract, enforced by prompt and then
-checked by a deterministic linter with an optional repair pass:
-  * every sentence names its own subject (no leading "It/They/These/This/Such",
-    no backward-pointing "its"/"their");
-  * quantity words stay welded to their substance ("iodine deficiency", never
-    "a deficiency in dietary iodine");
-  * causation is a verb and the cause is the subject ("Graves' disease causes
-    hyperthyroidism", never "is a frequent cause of");
-  * enumerations repeat the head noun ("type 1 deiodinase and type 2
-    deiodinase");
-  * an abbreviation is fixed once as "thyroxine (T4)" and then never alternates.
+TAG      PARENT     MEANING
 
-Content-level markdown INSIDE <con> is preserved: if a section body genuinely
-needs a short list or a table, that stays as markdown, because it is part of the
-content rather than part of the document skeleton. The literal [FIGURE:id]
-markers are likewise never touched.
+<doc>    root       Wraps the entire generated document.
+<meta>   doc        Document-level metadata block.
+<title>  meta       Chapter title. Plain text, no '#' marker.
+<topic>  meta       One-line statement of the subject matter. The only element
+                    inferred rather than carried over.
+<src>    meta       Provenance: source filename, book, figure and table
+                    counts, model, timestamp.
+<obj>    doc        Learning objectives, from the chapter's OBJECTIVES list.
+<goal>   obj        One learning objective. One per element, no bullet marker.
+<sec>    doc        One section. Attributes: id, level. Sections are flat;
+                    depth is carried by the level attribute.
+<head>   sec        Section heading, verbatim from the source.
+<con>    sec        A content paragraph carried over from the source. Only
+                    three things are changed: extraction artefacts are
+                    repaired, page-break splits are rejoined, and in-document
+                    figure and table mentions are wrapped in
+                    <figref>/<tblref>.
+<fig>    sec        A figure, emitted at the position it occupied in the
+                    source. Attributes: id; label when the source numbered it;
+                    src when it carried an image file; panel for the 'A'/'B'
+                    letter on an unnumbered inline diagram.
+<cap>    fig / tbl  Caption, taken from the source text.
+<desc>   fig        Figure description. Emitted empty and reserved: nothing in
+                    a textbook chapter describes the image itself.
+<figref> con        A reference to a <fig> in this document. Attribute: id.
+                    Wraps the original mention text, so the prose reads
+                    unchanged with the tags removed.
+<tbl>    sec        A table, emitted at its source position. Attributes: id,
+                    label. Holds <cap> and the source table markup.
+<tblref> con        A reference to a <tbl> in this document. Attribute: id.
+                    Wraps the original mention text.
+<sum>    doc        Chapter summary, from the source SUMMARY section.
+<def>    doc        Glossary, from the source GLOSSARY section.
+<term>   def        One definition, phrased as a complete sentence that begins
+                    with the term (e.g. 'Bioethics is the area ...').
+<ref>    doc        Reference list, from the source RECOMMENDED READING.
+<cit>    ref        A single citation.
 
-Figure blocks always look like:
-    <fig id="p5_b2">
-    [FIGURE:p5_b2]
-    <cap>...</cap>
-    <desc>...</desc>
+FAITHFULNESS
+
+The chapter is a finished text, so <con> is carried over, not rewritten.
+Every content paragraph in the source reaches exactly one <con>, and the
+tool warns loudly rather than silently dropping one. The only edits applied
+to carried-over text are mechanical repairs to PDF extraction damage:
+
+  * U+00A0 word separators become ordinary spaces;
+  * U+00AD, which the extractor emits in place of a real hyphen, becomes
+    an ASCII '-';
+  * paragraphs split mid-sentence at a page break are rejoined.
+
+MARKDOWN SYNTAX POLICY
+
+The tags carry the document structure, so structural markdown is not
+emitted:
+
+  * <title> and <head> hold plain text, with no '#' or '##' markers.
+    Heading depth is expressed by the level attribute on <sec>.
+  * List items are elements (<goal>, <term>, <cit>), not '- ' bullets.
+
+Content-level markup inside <con>, <cap> and <tbl> is preserved exactly as
+the source had it. That includes inline emphasis, <sup> and <sub>, LaTeX
+spans such as $\mathsf{pK_a}$, the HTML <table> blobs the extractor
+produces, and any mermaid diagram carried inside a <fig>. Nothing in
+element content is entity-escaped, because escaping would corrupt that
+markup; only attribute values are escaped.
+
+CROSS-REFERENCES
+
+A mention of a figure or table defined in this chapter is wrapped in place:
+
+    ... clinical insights (<figref id="fig-1-1">Figure 1-1</figref>).
+
+Mentions that point outside the chapter, such as 'see Figure 40-5', are
+left as plain text, because there is nothing in this document to link to.
+Removing the tags restores the source sentence exactly.
+
+BLOCK SHAPES
+
+    <fig id="fig-2-1" label="Figure 2-1" src="images/a1b2c3.jpg">
+    <cap>The water molecule has tetrahedral geometry.</cap>
+    <desc></desc>
     </fig>
+
+    <tbl id="tbl-2-1" label="Table 2-1">
+    <cap>Bond Energies for Atoms of Biologic Significance</cap>
+    <table>...</table>
+    </tbl>
+
