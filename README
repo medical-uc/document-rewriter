@@ -6,27 +6,94 @@ specifically for use by the pipeline listed in
 
   https://github.com/medical-uc/knowledge-graph-pipeline
 
-A textbook chapter is already finished prose, so the script does not rewrite
-it. Every content paragraph in the source is carried over verbatim into a
-`<con>`, with only the mechanical repairs the PDF extractor makes necessary:
-non-breaking spaces and stand-in soft hyphens are normalised, and paragraphs
-split mid-sentence at a page break are rejoined. Figures and tables are
-emitted at the position they held in the source, and mentions of them in the
-prose become inline `<figref>` and `<tblref>` references.
+That pipeline builds a knowledge graph, and textbook prose is poor input for
+it. A textbook sentence is written to be read in order by a person: it packs
+several claims together, leans on pronouns to name its subject, and leaves a
+good deal of its information in tables and diagrams, which are not sentences
+at all. So the script rewrites rather than carries over. Each section is read
+whole, the information in it is inventoried, and the section is restated as
+standalone declarative sentences, one claim each, every sentence naming its
+own subject. Tables and mermaid diagrams are restated into words as well.
+Figure and table references survive the rewrite and are anchored to the claim
+they illustrate.
 
-Inference is confined to the document metadata, which the source has no
-counterpart for. In practice that is a single call for `<topic>`, plus a
-caption for the occasional unnumbered inline diagram. Everything else, the
-title, objectives, summary, glossary and reading list, comes from the chapter
-itself. Because so little is inferred, `--offline` produces a complete and
-correct document with no back end at all.
+The rewrite adds nothing. It restates the section's information and may not
+infer, generalise, or bring in outside knowledge. It is also not a summary:
+splitting packed sentences apart and naming every subject makes the output
+longer than the source, which is expected.
 
-When it is used, the back end is hosted on
+Asking for one claim per sentence does not reliably get it either. Splitting
+a source's packed sentences apart should leave a section with more sentences
+than it started with, so a section that came back with barely more has not
+split anything, whatever its wording suggests. That ratio is measured per
+section, against two thresholds rather than one. Below 1.5 the section's
+paragraphs are sent back to be split; below 1.2 the section is also reported.
+Splitting is worth attempting well before a section is bad enough to be worth
+complaining about, and the gap between the two is where most of the work
+actually gets done: a result that comes back no better is refused and the
+original kept, so the wider net costs calls rather than quality.
+
+What counts as a source sentence matters more than it sounds. The PDF
+conversion writes math with spaces around its punctuation, as in
+`$1 . 8 \times 10^{-9}$`, so splitting on a period cuts a formula in half and
+counts each half as a sentence. It also renders a displayed equation as an
+alt-text line of its own and strands the clause introducing it on a colon.
+None of those is a claim, and they gather in exactly the formula-dense
+sections the ratio judges hardest, so they are excluded from the count. A
+section with fewer than ten source claims is not judged at all: the ratio
+quantises too coarsely there, failing a six-claim section at seven sentences
+and passing it at eight.
+
+A result is refused, and the original kept, when it loses a sentence, a
+number or a formula, or when it runs past three times its input in words.
+The word bound is deliberate: sentences are not bounded, because multiplying
+them is the point of the pass and one packed sentence can legitimately
+become five.
+
+Formulae are masked before that call and restored after it. Told to copy
+`$\mathsf{H}_3\mathsf{O}^+$` across verbatim, the model unwraps it into bare
+text, doubles the backslash in `\times`, and drops a closing delimiter so the
+span swallows the sentences behind it, all of which corrupt the claim while
+leaving every word in place. Each formula therefore goes out as an opaque
+`[FORMULA1]` and comes back in afterwards, which removes the opportunity
+rather than arguing about it. A result is still refused when a placeholder
+does not restore. Sections that read short after all this are reported.
+
+Asking for standalone sentences does not reliably get them. The model still
+opens perhaps one sentence in ten with a back-reference such as "This
+condition" or "These groups", which names nothing on its own. Those are
+found by inspection rather than by asking, and only the paragraphs holding
+one are sent back, with the section as context, to have the name filled in.
+Any that survive are reported. Repair runs after splitting, because splitting
+a sentence in two is itself a way to create a back-reference.
+
+Because the body is rewritten, there is no verbatim text to check the output
+against. Coverage is checked instead by a second pass that reads each
+section's source against its rewrite and reports the information the rewrite
+dropped. Findings are printed as warnings on stderr and the run exits
+non-zero. Pass `--no-audit` to skip that pass, which roughly halves the number
+of calls. Treat the findings as sections worth reading rather than as a
+defect list. The check is itself a model, and it reports information as
+missing that the rewrite in fact carries in different words: across the five
+Harper's chapters, roughly three findings in four name something the output
+demonstrably contains. Several of the rest are transitions and analogies the
+rewrite is meant to drop.
+
+Everything outside the body still comes from the chapter itself: the title,
+objectives, summary, glossary and reading list are collected, not generated.
+`<topic>` is the one element with no source counterpart, and is inferred.
+
+The back end is hosted on
 
   http://jupyter-02.aml1.id.iosda.org:8888
 
 through vLLM running the model `huatuogpt-o1-72b-4bit`. The Hugging Face path
-of the model is `mlx-community/HuatuoGPT-o1-72B-4bit`.
+of the model is `mlx-community/HuatuoGPT-o1-72B-4bit`. There is no offline
+mode: a chapter of N sections, T tables, D figure-attached diagrams or grids,
+S paragraphs needing splitting and R needing repair costs roughly
+2N + T + D + S + R + 1 calls, and without a back end there is no document to
+build.
+The calls fan out over `--workers`, and `--cache-dir` makes a rerun free.
 
 The file `TAG_SCHEMA.txt` specifies all the tags and what each of them
 contains. Regenerate it with `python3 rewrite_medical_md.py --print-schema`.
@@ -45,7 +112,9 @@ the input documents under `./inputs`, organised by subject and book:
 
 The script walks that tree, mirrors its structure into `./artifacts/outputs`,
 and passes any extra arguments straight through, so `./batch_process.sh
---offline` runs the whole corpus without touching the network.
+--no-audit` runs the whole corpus without the coverage pass.
 
-Every run checks that no source paragraph was lost, reporting any that were as
-warnings on stderr and exiting non-zero.
+A chapter that raised verification warnings is reported as `warnings:` and a
+chapter that produced no document at all as `FAILED:`, and only the latter
+makes the script exit non-zero. Warnings are the normal outcome of a rewrite,
+so treating them as failures would mark every run as failed.

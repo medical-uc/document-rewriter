@@ -6,17 +6,19 @@ rewrite_medical_md.py
 Convert medical textbook chapters (imperfectly extracted from PDF) into tagged
 markdown study documents for the knowledge-graph pipeline.
 
-The governing rule is faithfulness. A textbook chapter is already finished
-prose, so the body text is carried over rather than rewritten: every content
-paragraph in the source reaches a ``<con>`` in the output, with only the
-mechanical repairs the PDF extractor makes necessary. The document metadata is
-the one place inference is allowed, because the source has no counterpart for
-it.
+The governing rule is triple-readiness. Textbook prose is written to be read
+in order by a person: sentences carry several claims at once, subjects hide
+behind pronouns, and the facts held in tables and diagrams are not in
+sentences at all. That is poor input for triple extraction, so the body is
+rewritten rather than carried over. Each section is read whole, the
+information in it is inventoried, and the section is restated as standalone
+declarative sentences. Tables and mermaid diagrams are restated too, into
+words. Figure and table references survive and travel with the claim they
+belong to.
 
-An earlier version of this tool targeted slide-derived markdown, where the
-source was a keyword dump with no connected prose. There, generation was the
-only option and most of the machinery existed to keep generated prose honest.
-None of that applies to a textbook, and none of it survives.
+Nothing is added: the rewrite restates the section's information and may not
+infer, generalise or supply outside knowledge. It is also not a summary, and
+is expected to run longer than its source rather than shorter.
 
 Pipeline
 --------
@@ -24,15 +26,35 @@ Pipeline
   2. parse      -- scan into a flat element stream in source order
   3. metadata   -- title/objectives/summary/glossary from the source;
                    one LLM call for <topic>, which has no source counterpart
-  4. link       -- turn in-document 'Figure 2-1' mentions into <figref>
-  5. render     -- assemble the tagged markdown
-  6. verify     -- prove every source paragraph reached the output
+  4. rewrite    -- one call per section, per table, and per mermaid diagram
+                   or data table attached to a figure
+  5. split      -- one call per paragraph of a section whose rewrite has too
+                   few sentences to have split its source's packed claims
+  6. repair     -- one call per rewritten paragraph that still opens a
+                   sentence with a back-reference, naming what it refers to
+  7. audit      -- one call per section, reporting information the rewrite
+                   dropped; skippable with --no-audit
+  8. link       -- turn in-document 'Figure 2-1' mentions into <figref>
+  9. render     -- assemble the tagged markdown, anchoring each figure and
+                   table after the <con> that first references it
+ 10. verify     -- structural checks, any back-reference that survived
+                   repair, any section still under-split, plus whatever the
+                   audit found
 
 Extraction damage repaired in stage 1
 -------------------------------------
   * U+00A0 is used as the word separator throughout;
   * U+00AD stands in for a real hyphen ('Henderson<AD>Hasselbalch');
   * paragraphs are split mid-sentence wherever a page break fell.
+
+Cost
+----
+Roughly 2N + T + D + S + R + 1 calls for a chapter of N sections, T tables,
+D figure-attached diagrams or grids, S paragraphs needing splitting and R
+needing repair, against 1 for the carry-over tool this replaced. S and R are
+proportional to the damage rather than to the chapter: splitting has touched
+about a quarter of sections and repair about a fifth of paragraphs. The calls
+fan out over --workers, and --cache-dir makes a rerun free.
 
 Backend
 -------
@@ -50,9 +72,12 @@ See TAG_VOCABULARY below and the table printed by ``--print-schema``.
 Usage
 -----
     python rewrite_medical_md.py chapter.md -o out.md
-    python rewrite_medical_md.py chapter.md -o out.md --offline   # no network
+    python rewrite_medical_md.py chapter.md -o out.md --no-audit
     python rewrite_medical_md.py chapter.md -o out.md -v --cache-dir ./cache
     python rewrite_medical_md.py --print-schema
+
+The backend is required: there is no offline mode, because a rewrite with no
+model is not a document.
 
 Zero third-party dependencies (stdlib only).
 """
@@ -88,11 +113,29 @@ MAXTOK_TOPIC = 1024
 MAXTOK_CAPTION = 1024
 MAXTOK_OBJECTIVES = 2048
 MAXTOK_SUMMARY = 2048
+MAXTOK_REWRITE = 6144          # a rewrite runs longer than its source
+MAXTOK_TABLE = 4096
+MAXTOK_DIAGRAM = 2048
+MAXTOK_SPLIT = 6144            # a split paragraph runs longer than its input
+MAXTOK_REPAIR = 4096
+MAXTOK_AUDIT = 2048
 
 TEMP_TOPIC = 0.30
 TEMP_CAPTION = 0.15            # conservative: stay close to the source text
 TEMP_OBJECTIVES = 0.35
 TEMP_SUMMARY = 0.35
+# The rewrite stages restate information rather than compose, so they sample
+# far more conservatively than the metadata stages.
+TEMP_REWRITE = 0.20
+TEMP_TABLE = 0.10
+TEMP_DIAGRAM = 0.10
+# Splitting redistributes claims across sentences without inventing any, so it
+# samples as tightly as the restating stages.
+TEMP_SPLIT = 0.10
+# Repair swaps a back-reference for a name and changes nothing
+# else, so it samples as tightly as the tool allows.
+TEMP_REPAIR = 0.05
+TEMP_AUDIT = 0.10
 
 VERBOSE = False
 
@@ -113,8 +156,8 @@ TAG_VOCABULARY: List[Tuple[str, str, str]] = [
     ("doc", "root", "Wraps the entire generated document."),
     ("meta", "doc", "Document-level metadata block."),
     ("title", "meta", "Chapter title. Plain text, no '#' marker."),
-    ("topic", "meta", "One-line statement of the subject matter. The only "
-                      "element inferred rather than carried over."),
+    ("topic", "meta", "One-line statement of the subject matter, inferred "
+                      "from the chapter."),
     ("src", "meta", "Provenance: source filename, book, figure and table "
                     "counts, model, timestamp."),
     ("obj", "doc", "Learning objectives, from the chapter's OBJECTIVES list."),
@@ -123,24 +166,25 @@ TAG_VOCABULARY: List[Tuple[str, str, str]] = [
     ("sec", "doc", "One section. Attributes: id, level. Sections are flat; "
                    "depth is carried by the level attribute."),
     ("head", "sec", "Section heading, verbatim from the source."),
-    ("con", "sec", "A content paragraph carried over from the source. Only "
-                   "three things are changed: extraction artefacts are "
-                   "repaired, page-break splits are rejoined, and in-document "
-                   "figure and table mentions are wrapped in <figref>/<tblref>."),
-    ("fig", "sec", "A figure, emitted at the position it occupied in the "
-                   "source. Attributes: id; label when the source numbered "
+    ("con", "sec / tbl", "Rewritten content. Under <sec>, one claim cluster "
+                         "from the section's rewrite; the grouping is the "
+                         "rewriter's, not the source's paragraph breaks. "
+                         "Under <tbl>, the sentences the table's grid became."),
+    ("fig", "sec", "A figure. Attributes: id; label when the source numbered "
                    "it; src when it carried an image file; panel for the "
-                   "'A'/'B' letter on an unnumbered inline diagram."),
+                   "'A'/'B' letter on an unnumbered inline diagram. Emitted "
+                   "after the <con> that first references it."),
     ("cap", "fig / tbl", "Caption, taken from the source text."),
-    ("desc", "fig", "Figure description. Emitted empty and reserved: nothing "
-                    "in a textbook chapter describes the image itself."),
+    ("desc", "fig", "The figure's own content in words. Holds the sentences "
+                    "a mermaid diagram or an attached data table became, and "
+                    "is empty for a figure that is only an image."),
     ("figref", "con", "A reference to a <fig> in this document. Attribute: "
-                      "id. Wraps the original mention text, so the prose "
-                      "reads unchanged with the tags removed."),
-    ("tbl", "sec", "A table, emitted at its source position. Attributes: id, "
-                   "label. Holds <cap> and the source table markup."),
+                      "id. Wraps the mention text."),
+    ("tbl", "sec", "A table. Attributes: id, label. Holds <cap> and a <con> "
+                   "of prose; the source grid markup is not emitted. Emitted "
+                   "after the <con> that first references it."),
     ("tblref", "con", "A reference to a <tbl> in this document. Attribute: "
-                      "id. Wraps the original mention text."),
+                      "id. Wraps the mention text."),
     ("sum", "doc", "Chapter summary, from the source SUMMARY section."),
     ("def", "doc", "Glossary, from the source GLOSSARY section."),
     ("term", "def", "One definition, phrased as a complete sentence that "
@@ -150,17 +194,46 @@ TAG_VOCABULARY: List[Tuple[str, str, str]] = [
 ]
 
 SCHEMA_NOTES = """
-FAITHFULNESS
+WHAT THE BODY IS
 
-The chapter is a finished text, so <con> is carried over, not rewritten.
-Every content paragraph in the source reaches exactly one <con>, and the
-tool warns loudly rather than silently dropping one. The only edits applied
-to carried-over text are mechanical repairs to PDF extraction damage:
+The body is rewritten, not carried over. Each section is read whole, the
+information in it is inventoried, and the section is restated as prose aimed
+at triple extraction:
 
-  * U+00A0 word separators become ordinary spaces;
-  * U+00AD, which the extractor emits in place of a real hyphen, becomes
-    an ASCII '-';
-  * paragraphs split mid-sentence at a page break are rejoined.
+  * one claim per sentence, shaped subject-predicate-object. Splitting a
+    source's packed sentences apart should leave a section with more
+    sentences than it started with, so a section that came back with too
+    few is sent back to be split, and is reported by verify if it still
+    reads short;
+  * every sentence names its own subject, so no sentence depends on its
+    neighbour to say what it is about. A sentence that still opens with a
+    back-reference after the rewrite is sent back to have the name filled
+    in, and is reported by verify if it survives that;
+  * the source's own terms, spellings, numbers, units and conditions;
+  * coordination that hides a relation is split into separate sentences;
+  * transitions and rhetorical framing are dropped;
+  * nothing is added, inferred or generalised.
+
+Paragraph grouping is the rewriter's, so a <con> does not correspond to a
+source paragraph. A section's <con> count is unrelated to its source's.
+
+Tables and mermaid diagrams hold information that is not in sentences at
+all, so they are restated too: a table's grid becomes a <con> of sentences
+inside its <tbl>, each naming its row and its column so it stands alone, and
+a mermaid diagram becomes one sentence per arrow inside the figure's <desc>.
+A data table the extractor attached to a figure rather than to a <tbl> is
+restated the same way, into that figure's <desc>. Neither grid markup nor
+mermaid source is emitted, unless a conversion failed, in which case the
+block goes out as it came and verify reports it.
+
+COVERAGE
+
+Because the body is rewritten, there is no verbatim text to check the output
+against. Coverage is checked instead by a second pass that reads each
+section's source against its rewrite and reports information the rewrite
+dropped. Findings are warnings on stderr and a non-zero exit, and --no-audit
+skips the pass. This is a weaker guarantee than the containment check it
+replaced, and it is the price of rewriting.
 
 MARKDOWN SYNTAX POLICY
 
@@ -171,12 +244,10 @@ emitted:
     Heading depth is expressed by the level attribute on <sec>.
   * List items are elements (<goal>, <term>, <cit>), not '- ' bullets.
 
-Content-level markup inside <con>, <cap> and <tbl> is preserved exactly as
-the source had it. That includes inline emphasis, <sup> and <sub>, LaTeX
-spans such as $\\mathsf{pK_a}$, the HTML <table> blobs the extractor
-produces, and any mermaid diagram carried inside a <fig>. Nothing in
-element content is entity-escaped, because escaping would corrupt that
-markup; only attribute values are escaped.
+Content-level markup is preserved: inline emphasis, <sup> and <sub>, and
+LaTeX spans such as $\\mathsf{pK_a}$ survive the rewrite. Nothing in element
+content is entity-escaped, because escaping would corrupt that markup; only
+attribute values are escaped.
 
 CROSS-REFERENCES
 
@@ -184,9 +255,11 @@ A mention of a figure or table defined in this chapter is wrapped in place:
 
     ... clinical insights (<figref id="fig-1-1">Figure 1-1</figref>).
 
-Mentions that point outside the chapter, such as 'see Figure 40-5', are
-left as plain text, because there is nothing in this document to link to.
-Removing the tags restores the source sentence exactly.
+The rewriter is told to keep a pointer in the sentence carrying the
+information the figure illustrates, and the block itself is emitted after
+the <con> that first points at it. Mentions that point outside the chapter,
+such as 'see Figure 40-5', are left as plain text, because there is nothing
+in this document to link to.
 
 BLOCK SHAPES
 
@@ -197,7 +270,10 @@ BLOCK SHAPES
 
     <tbl id="tbl-2-1" label="Table 2-1">
     <cap>Bond Energies for Atoms of Biologic Significance</cap>
-    <table>...</table>
+    <con>
+    An O-O bond has a bond energy of 34 kcal/mol.
+    An S-S bond has a bond energy of 51 kcal/mol.
+    </con>
     </tbl>
 """
 
@@ -390,47 +466,6 @@ class LLMClient:
             raise LLMError(f"unexpected response shape: {str(body)[:400]}") from exc
 
 
-class OfflineClient(LLMClient):
-    """Deterministic stand-in used by --offline; never touches the network.
-
-    Inference is now confined to metadata, so a run with no model at all still
-    produces a complete and correct document -- only <topic> degrades, from an
-    inferred sentence to one derived from the title. That makes offline the
-    normal way to work on the parser, not merely a test mode.
-    """
-
-    def __init__(self, doc: "SourceDoc") -> None:
-        """Bind to the parsed document the derived answers are read from."""
-        super().__init__(cache_dir=None)
-        self.doc = doc
-
-    def chat_full(self, system: str, user: str, max_tokens: int = 2048,
-                  temperature: float = 0.4, tag: str = "") -> Tuple[str, str]:
-        """Answer from the parsed document instead of the model.
-
-        Only ``tag`` is consulted; the prompt and sampling parameters are
-        accepted and ignored so call sites need no offline special case.
-        """
-        return self._derive(tag), ""
-
-    def _derive(self, tag: str) -> str:
-        """Build the answer for one prompt tag from the source document."""
-        kind, _, arg = tag.partition(":")
-        if kind == "topic":
-            heads = [s.heading for s in self.doc.sections][:4]
-            tail = "; ".join(heads)
-            return f"{self.doc.title}." + (f" Covers {tail}." if tail else "")
-        if kind == "objectives":
-            return "\n".join(f"Understand {s.heading.lower()}."
-                             for s in self.doc.sections[:8])
-        if kind == "summary":
-            return ""
-        if kind == "caption":
-            fig = next((f for f in self.doc.figures if f.fid == arg), None)
-            return fig.label if fig else ""
-        return ""
-
-
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 _OPEN_THINK_RE = re.compile(r"^.*?</think>", re.S | re.I)
 _FINAL_RE = re.compile(r"##+\s*Final\s+Response\s*:?\s*", re.I)
@@ -595,20 +630,29 @@ class Figure:
     extra: str = ""
     # 'A'/'B' on an unnumbered image: the source's only handle on that panel.
     panel: str = ""
-    # Parsed but deliberately not rendered: <desc> is empty for now, and this
-    # is the text it would be built from.
+    # The extractor's machine description of the image file. It says nothing
+    # about the chapter's subject matter, so it feeds caption inference only
+    # and never reaches the output.
     alt_text: str = ""
+    # A mermaid diagram in ``extra``, restated as sentences. Fills <desc>.
+    diagram_prose: List[str] = field(default_factory=list)
 
 
 @dataclass
 class Table:
-    """A numbered table and the source markup of its body."""
+    """A numbered table and the source markup of its body.
+
+    ``body`` is the extractor's <table> blob. It is the input the prose is
+    built from and is not itself rendered, because a knowledge-graph
+    extractor cannot read a grid.
+    """
 
     tid: str
     label: str
     order: int
     caption: str = ""
     body: str = ""
+    prose: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -627,12 +671,36 @@ class Element:
 
 @dataclass
 class Section:
-    """A source heading and everything that followed it."""
+    """A source heading and everything that followed it.
+
+    ``elements`` is the source in source order and is what the rewrite reads.
+    ``rewritten`` is what the rewrite produced and what gets rendered: one
+    string per <con>, re-chunked by claim rather than following the source's
+    paragraph breaks.
+    """
 
     sid: str
     heading: str
     level: int
     elements: List[Element] = field(default_factory=list)
+    rewritten: List[str] = field(default_factory=list)
+
+    @property
+    def source_paragraphs(self) -> List[str]:
+        """The section's content paragraphs, in source order."""
+        return [e.text for e in self.elements if e.kind == "para"]
+
+    @property
+    def figures(self) -> List[Figure]:
+        """The figures that occur in this section, in source order."""
+        return [e.figure for e in self.elements
+                if e.kind == "figure" and e.figure is not None]
+
+    @property
+    def tables(self) -> List[Table]:
+        """The tables that occur in this section, in source order."""
+        return [e.table for e in self.elements
+                if e.kind == "table" and e.table is not None]
 
 
 @dataclass
@@ -667,10 +735,14 @@ class SourceDoc:
 
     @property
     def content_words(self) -> int:
-        """Total words across every carried-over content paragraph."""
-        return sum(word_count(e.text)
-                   for s in self.sections for e in s.elements
-                   if e.kind == "para")
+        """Total words across every source content paragraph."""
+        return sum(word_count(p)
+                   for s in self.sections for p in s.source_paragraphs)
+
+    @property
+    def rewritten_words(self) -> int:
+        """Total words across every rewritten paragraph."""
+        return sum(word_count(p) for s in self.sections for p in s.rewritten)
 
 
 def parse_source(path: str) -> SourceDoc:
@@ -1075,8 +1147,56 @@ def word_count(text: str) -> int:
     return len(re.sub(r"[#*`>|\[\]]", " ", text).split())
 
 
+_JSON_ESCAPE = re.compile(r'\\(?:u[0-9a-fA-F]{4}|["\\/bfnrt])')
+_JSON_CONTROL = {"\n": "\\n", "\r": "\\r", "\t": "\\t",
+                 "\b": "\\b", "\f": "\\f"}
+
+
+def repair_json_text(blob: str) -> str:
+    """Re-escape a JSON candidate the model wrote by hand.
+
+    The rewrite prompts ask for prose containing LaTeX, and a lone backslash
+    ahead of a letter is an invalid JSON escape that rejects the whole
+    object. Raw newlines inside a string reject it the same way. Both are
+    escaped here; every already-valid escape is passed through untouched, so
+    a well-formed blob comes back unchanged.
+    """
+    out: List[str] = []
+    index = 0
+    inside_string = False
+    while index < len(blob):
+        character = blob[index]
+        if not inside_string:
+            inside_string = character == '"'
+            out.append(character)
+            index += 1
+            continue
+        escape = _JSON_ESCAPE.match(blob, index)
+        if escape:
+            out.append(escape.group(0))
+            index = escape.end()
+            continue
+        if character == "\\":
+            out.append("\\\\")
+        elif character == '"':
+            inside_string = False
+            out.append(character)
+        elif ord(character) < 0x20:
+            out.append(_JSON_CONTROL.get(character,
+                                         "\\u%04x" % ord(character)))
+        else:
+            out.append(character)
+        index += 1
+    return "".join(out)
+
+
 def extract_json(text: str) -> Any:
-    """Pull the first balanced JSON object or array out of a model response."""
+    """Pull the first balanced JSON object or array out of a model response.
+
+    A candidate that fails to parse is retried once through
+    repair_json_text, which fixes the escaping mistakes the model makes
+    around LaTeX.
+    """
     text = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip(), flags=re.M)
     starts = [i for i, ch in enumerate(text) if ch in "{["]
     for start in starts:
@@ -1102,8 +1222,13 @@ def extract_json(text: str) -> Any:
             elif ch == closer:
                 depth -= 1
                 if depth == 0:
+                    candidate = text[start:i + 1]
                     try:
-                        return json.loads(text[start:i + 1])
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+                    try:
+                        return json.loads(repair_json_text(candidate))
                     except json.JSONDecodeError:
                         break
     raise ValueError("no parseable JSON found in model response")
@@ -1266,7 +1391,839 @@ def fill_missing_captions(client: LLMClient, doc: SourceDoc, workers: int) -> No
 
 
 # --------------------------------------------------------------------------
-# Stage 4: cross-reference linking
+# Stage 4: rewriting
+# --------------------------------------------------------------------------
+
+SYS_REWRITER = (
+    "You restate passages from a medical textbook as declarative statements "
+    "for a knowledge graph. Every sentence you write must survive being read "
+    "on its own, out of order, with no neighbouring sentence for context. "
+    "You answer with a single JSON object and nothing else: no preamble, no "
+    "explanation, no markdown fence."
+)
+
+# Shared by both grid-reading prompts. A grid whose columns are unlabelled
+# is the case that goes wrong quietly: naming only the row turns one row of
+# four values into four sentences that contradict each other.
+GRID_COLUMN_RULE = (
+    "The columns may carry no heading of their own. Where they do not, "
+    "identify each column by the value that distinguishes it, normally the "
+    "one in the grid's first row, and carry that identifier into every "
+    "sentence drawn from that column, as in 'In the solution whose initial "
+    "pH is 5.00, ...'. Never write two sentences that assert different "
+    "values for the same subject and property: a reader who sees only one "
+    "of them must not be misled. If a column cannot be identified at all, "
+    "leave its values out and describe only what the grid does say.\n\n"
+)
+
+# The rewrite rules, shared by the section, table and diagram prompts so the
+# three stages produce prose of one shape. These are what make the output
+# tractable for triple extraction: a sentence that names its subject and
+# carries one relation maps onto one triple, and a sentence that leans on
+# 'it' or packs three clauses does not.
+REWRITE_RULES = """\
+Rules:
+1. One claim per sentence. Each sentence states a single relationship
+   between a named subject and a named object.
+2. Name the subject explicitly in every sentence. A sentence that needs the
+   previous sentence to identify its subject is wrong. This rules out bare
+   pronouns ('it', 'they', 'them'), and it equally rules out a demonstrative
+   in front of a noun ('this condition', 'these groups', 'such
+   interactions'), because the noun still does not say which one.
+     Wrong: Nephrogenic diabetes insipidus resists vasopressin. This
+            condition prevents the kidneys from concentrating urine.
+     Right: Nephrogenic diabetes insipidus resists vasopressin.
+            Nephrogenic diabetes insipidus prevents the kidneys from
+            concentrating urine.
+   Repeating a long name in consecutive sentences is correct here, and is
+   always preferred to a pronoun.
+3. Use the source's own terminology, spelled exactly as the source spells
+   it. Never substitute a synonym for a technical term. Give an
+   abbreviation's full form the first time it appears, as 'antidiuretic
+   hormone (ADH)', and use it consistently after that.
+4. Reproduce every number, unit, range, percentage and condition exactly.
+   Keep the condition attached to the claim it governs, as in 'At 25 degrees
+   Celsius, the dielectric constant of water is 78.5.'
+5. Split coordination that hides a relation. 'A and B cause C' becomes two
+   sentences. 'A, which does X, causes C' becomes two sentences.
+6. Prefer the active voice and put the entity first.
+7. Drop transitions, rhetorical framing and asides that carry no fact
+   ('It follows that', 'As we shall see', 'Interestingly').
+8. Add nothing. Every statement must be supported by the passage given to
+   you. Do not infer, generalise, or supply outside knowledge.
+9. Keep inline markup as the source has it: <sup>, <sub>, and LaTeX spans
+   such as $\\mathsf{pK_a}$."""
+
+
+def _figure_inventory(section: Section) -> str:
+    """List the section's referenceable figures and tables for a prompt.
+
+    Only labelled ones appear: an unnumbered inline diagram has no mention
+    string the prose could use, so offering it would invite an invented one.
+    """
+    lines: List[str] = []
+    for fig in section.figures:
+        if fig.label:
+            lines.append(f"  {fig.label}: {fig.caption or '(no caption)'}")
+    for tbl in section.tables:
+        if tbl.label:
+            lines.append(f"  {tbl.label}: {tbl.caption or '(no caption)'}")
+    return "\n".join(lines)
+
+
+def prompt_section(section: Section) -> str:
+    """Build the prompt that rewrites one section into knowledge-graph prose."""
+    body = "\n\n".join(section.source_paragraphs)
+    inventory = _figure_inventory(section)
+
+    parts = [
+        "Below is one section of a medical textbook chapter, under the "
+        "heading shown. Read all of it and take note of every piece of "
+        "information it contains: entities, properties, values, causes, "
+        "effects, mechanisms, classifications and conditions.\n",
+        f"HEADING: {section.heading}\n",
+        f"SECTION TEXT:\n{body}\n",
+    ]
+
+    if inventory:
+        parts.append(
+            "This section contains the following figures and tables:\n"
+            f"{inventory}\n\n"
+            "Where the passage points the reader at one of them, keep that "
+            "pointer in the sentence carrying the information it illustrates, "
+            "written exactly as the label above and in parentheses, for "
+            "example '(Figure 2-1)'. Write the label as plain text; never "
+            "write a tag. Do not refer to a figure or table that is not "
+            "listed above, except where the passage itself points outside "
+            "this chapter, which you should carry over unchanged.\n"
+        )
+
+    parts.append(
+        "Rewrite the section using the information you noted. Cover every "
+        "piece of it. Do not summarise and do not shorten: the rewrite "
+        "exists to make the information easier to read as statements, not "
+        "to make it briefer.\n"
+    )
+    parts.append(REWRITE_RULES)
+    parts.append(
+        "\nGroup the sentences into paragraphs, one paragraph per subject or "
+        "closely related group of subjects. A paragraph here is a grouping "
+        "of standalone sentences, not connected prose: the sentences in it "
+        "carry no transitions, no back-references and no reading order, and "
+        "every one of them still names its own subject. Assume each "
+        "sentence will be pulled out of its paragraph and read by itself. "
+        "Answer with JSON of the form "
+        '{"paragraphs": ["...", "..."]}.'
+    )
+    return "\n".join(parts)
+
+
+def _parse_paragraphs(raw: str, key: str, tag: str) -> List[str]:
+    """Read a list of strings out of a model response.
+
+    Falls back to splitting the raw completion on blank lines when the JSON
+    is unparseable, because a model that ignored the output contract has
+    usually still written usable prose. A response that did attempt JSON and
+    still will not parse returns nothing instead, so the caller fails loudly
+    rather than write braces into the document as prose.
+    """
+    try:
+        data = extract_json(raw)
+    except ValueError:
+        body = raw.strip()
+        if body.startswith("{") or body.startswith("["):
+            log(f"{tag}: JSON response is unparseable even after repair")
+            return []
+        log(f"{tag}: no JSON in response; falling back to blank-line split")
+        chunks = re.split(r"\n\s*\n", body)
+        return [c.strip() for c in chunks if c.strip()]
+
+    if isinstance(data, dict):
+        data = data.get(key, [])
+    if isinstance(data, str):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [str(item).strip() for item in data if str(item).strip()]
+
+
+def rewrite_sections(client: LLMClient, doc: SourceDoc, workers: int) -> None:
+    """Rewrite every section's prose in place.
+
+    Raises LLMError if a section with source paragraphs comes back empty,
+    rather than emit a section whose content silently vanished.
+    """
+    todo = [s for s in doc.sections if s.source_paragraphs]
+    if not todo:
+        return
+
+    failures: List[str] = []
+
+    def one(section: Section) -> None:
+        """Rewrite a single section, recording a failure instead of raising."""
+        raw = client.chat(SYS_REWRITER, prompt_section(section),
+                          max_tokens=MAXTOK_REWRITE, temperature=TEMP_REWRITE,
+                          tag=f"rewrite:{section.sid}")
+        section.rewritten = _parse_paragraphs(raw, "paragraphs",
+                                              f"rewrite:{section.sid}")
+        if not section.rewritten:
+            failures.append(section.sid)
+
+    _run_parallel(one, todo, workers, "rewrite")
+
+    if failures:
+        raise LLMError("no usable rewrite for section(s): "
+                       + ", ".join(failures))
+
+
+def prompt_table(tbl: Table, doc: SourceDoc) -> str:
+    """Build the prompt that turns one table into standalone sentences."""
+    return (
+        f"Below is a table from a chapter of a medical textbook titled "
+        f"'{doc.title}'. A knowledge-graph extractor cannot read a grid, so "
+        "the table has to become sentences.\n\n"
+        f"LABEL: {tbl.label}\n"
+        f"CAPTION: {tbl.caption or '(none)'}\n\n"
+        f"TABLE:\n{tbl.body}\n\n"
+        "Write one sentence for every value in the table. Each sentence "
+        "must name the row it came from and the quantity or property the "
+        "column represents, so that it stands alone without the grid. For "
+        "a table of bond energies, that reads 'An O-O bond has a bond "
+        "energy of 34 kcal/mol.' Work through the rows in order and leave "
+        "no value out. Where a column heading names a unit, put the unit in "
+        "the sentence.\n\n"
+        + GRID_COLUMN_RULE
+        + REWRITE_RULES +
+        '\n\nAnswer with JSON of the form {"sentences": ["...", "..."]}.'
+    )
+
+
+def rewrite_tables(client: LLMClient, doc: SourceDoc, workers: int) -> None:
+    """Turn every table body into prose, in place.
+
+    A table whose prose fails is logged and left with empty prose; verify
+    reports it. One unreadable grid should not lose the chapter.
+    """
+    todo = [t for t in doc.tables if t.body]
+    if not todo:
+        return
+
+    def one(tbl: Table) -> None:
+        """Convert a single table, logging and skipping on backend failure."""
+        try:
+            raw = client.chat(SYS_REWRITER, prompt_table(tbl, doc),
+                              max_tokens=MAXTOK_TABLE, temperature=TEMP_TABLE,
+                              tag=f"table:{tbl.tid}")
+        except LLMError as exc:                           # noqa: BLE001
+            log(f"table prose failed for {tbl.tid}: {exc}")
+            return
+        tbl.prose = _parse_paragraphs(raw, "sentences", f"table:{tbl.tid}")
+
+    _run_parallel(one, todo, workers, "tables")
+
+
+# A diagram carried inside a <details> block. The extractor emits these as
+# mermaid, which is the one thing in a chapter that genuinely describes its
+# own image, so its prose fills <desc>.
+MERMAID_RE = re.compile(r"```\s*mermaid\b(.*?)```", re.S | re.I)
+EXTRA_TABLE_RE = re.compile(r"<table\b", re.I)
+
+
+def mermaid_source(extra: str) -> str:
+    """Return the mermaid body inside a figure's extra block, or ''."""
+    m = MERMAID_RE.search(extra or "")
+    return m.group(1).strip() if m else ""
+
+
+def figure_extra_kind(extra: str) -> str:
+    """Classify a figure's extra block as 'mermaid', 'table' or ''.
+
+    The extractor attaches whatever structured block trailed the figure.
+    Both kinds carry information a triple extractor cannot read, so both
+    become <desc> prose; '' means there is nothing to convert.
+    """
+    if mermaid_source(extra):
+        return "mermaid"
+    if extra and EXTRA_TABLE_RE.search(extra):
+        return "table"
+    return ""
+
+
+def prompt_diagram(fig: Figure, doc: SourceDoc) -> str:
+    """Build the prompt that turns one figure's extra block into sentences.
+
+    Dispatches on figure_extra_kind, because a mermaid graph is read arrow
+    by arrow and a grid is read cell by cell.
+    """
+    head = (
+        f"LABEL: {fig.label or '(unnumbered)'}\n"
+        f"CAPTION: {fig.caption or '(none)'}\n\n"
+    )
+    if figure_extra_kind(fig.extra) == "table":
+        task = (
+            f"Below is a data table attached to a figure in a chapter of a "
+            f"medical textbook titled '{doc.title}'. A knowledge-graph "
+            "extractor cannot read a grid, so the table has to become "
+            "sentences.\n\n"
+            f"{head}"
+            f"TABLE:\n{fig.extra}\n\n"
+            "Write one sentence for every value in the grid. Name the "
+            "value's row and its column in the sentence, so the sentence "
+            "stands on its own without the grid. Carry every number and "
+            "unit across exactly. Cover every cell that holds a value.\n\n"
+            + GRID_COLUMN_RULE
+        )
+    else:
+        task = (
+            f"Below is a mermaid diagram from a chapter of a medical "
+            f"textbook titled '{doc.title}'. A knowledge-graph extractor "
+            "cannot read mermaid, so the diagram has to become "
+            "sentences.\n\n"
+            f"{head}"
+            f"DIAGRAM:\n{mermaid_source(fig.extra)}\n\n"
+            "Write one sentence for every arrow in the diagram, using the "
+            "node labels exactly as the diagram spells them, and naming the "
+            "relationship the arrow asserts in the language of the caption. "
+            "Cover every arrow. Then write one closing sentence naming what "
+            "the diagram as a whole relates.\n\n"
+        )
+    return (
+        task +
+        "Do not describe the figure as a figure: write the information "
+        "itself, not 'the figure shows'.\n\n"
+        + REWRITE_RULES +
+        '\n\nAnswer with JSON of the form {"sentences": ["...", "..."]}.'
+    )
+
+
+def rewrite_diagrams(client: LLMClient, doc: SourceDoc, workers: int) -> None:
+    """Turn every figure's structured extra block into prose, in place.
+
+    Covers both mermaid diagrams and the data tables the extractor attaches
+    to a figure. A figure whose conversion fails keeps its extra block and
+    is reported by verify.
+    """
+    todo = [f for f in doc.figures if figure_extra_kind(f.extra)]
+    if not todo:
+        return
+
+    def one(fig: Figure) -> None:
+        """Convert one extra block, logging and skipping on backend failure."""
+        tag = f"{figure_extra_kind(fig.extra)}:{fig.fid}"
+        try:
+            raw = client.chat(SYS_REWRITER, prompt_diagram(fig, doc),
+                              max_tokens=MAXTOK_DIAGRAM,
+                              temperature=TEMP_DIAGRAM,
+                              tag=tag)
+        except LLMError as exc:                           # noqa: BLE001
+            log(f"figure prose failed for {fig.fid}: {exc}")
+            return
+        fig.diagram_prose = _parse_paragraphs(raw, "sentences", tag)
+
+    _run_parallel(one, todo, workers, "figure extras")
+
+
+# --------------------------------------------------------------------------
+# Stage 5: claim splitting
+# --------------------------------------------------------------------------
+
+# A rewrite that obeys the one-claim-per-sentence rule ends up with more
+# sentences than its source, because textbook prose packs several claims into
+# one sentence. A section that came back with barely more sentences than it
+# started with therefore did not split anything, whatever its wording suggests.
+# A section at or below this ratio is reported as under-split.
+SPLIT_RATIO_FLOOR = 1.2
+
+# Sending a section for splitting is cheap and refusable, so the stage uses a
+# more generous threshold than the report does. Splitting is worth attempting
+# well before a section is bad enough to be worth complaining about, and a
+# section between the two thresholds gains sentences without ever having been
+# reported. A result that comes back no better is refused by the guards and the
+# original kept, so the wider net costs calls rather than quality.
+SPLIT_TRIGGER_RATIO = 1.5
+
+# Below this many source claims the ratio quantises too coarsely to mean
+# anything. A six-claim section fails at seven sentences and passes at eight,
+# and that gap is not a real distinction about how well it was split.
+SPLIT_MIN_SOURCE_SENTENCES = 10
+
+# The converter writes a displayed equation out as an alt-text line of its own,
+# in a handful of shapes: 'An equation reads, ...', 'A reaction reads, ...',
+# 'Two reversible reactions of ...', 'Two calculations to find ...'.
+EQUATION_ALT_TEXT_RE = re.compile(
+    r"^(?:An?|Two|Three|Four) (?:\w+ )?"
+    r"(?:equations?|reactions?|calculations?)\b")
+
+# A split redistributes claims; it does not invent them. Sentence count is the
+# wrong thing to bound here, because multiplying sentences is the whole point:
+# one packed sentence legitimately becomes five. Words are the honest measure,
+# since splitting only repeats subjects while padding introduces new content.
+# Observed splits run to 2.6x words, so this refuses well clear of them.
+SPLIT_WORD_CEILING = 3.0
+
+NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+# LaTeX spans and the sup/sub tags carry chemical formulae, so a split that
+# quietly unwraps '$\mathsf{H}_3\mathsf{O}^+$' into bare text has corrupted
+# the claim even though every word survived.
+MARKUP_RE = re.compile(r"\$[^$]+\$|</?su[bp]>")
+
+# Told to copy formulae verbatim, the model still unwraps them, doubles the
+# backslash in '\times', and drops a closing delimiter so the span swallows the
+# sentences after it. Masking each formula behind an opaque token takes away
+# the opportunity instead of arguing about it. A whole '<sup>2</sup>' is masked
+# as one unit so its digit cannot be stranded from its tags.
+MASKABLE_RE = re.compile(r"\$[^$]+\$|<(su[bp])>.*?</\1>|</?su[bp]>")
+
+PLACEHOLDER_TEMPLATE = "[FORMULA{}]"
+
+PLACEHOLDER_RE = re.compile(r"\[FORMULA(\d+)\]")
+
+
+def conversion_artefact(sentence: str) -> bool:
+    """Report whether a counted source sentence is PDF-conversion debris.
+
+    An odd number of '$' means the sentence splitter cut through a formula,
+    because the converter writes math with spaces around its punctuation, as
+    in '$1 . 8 \\times 10^{-9}$'. A trailing colon marks the clause that
+    introduces a displayed equation, and the equation arrives as an alt-text
+    line of its own. None of the three is a claim.
+    """
+    if sentence.count("$") % 2 == 1:
+        return True
+    if sentence.rstrip().endswith(":"):
+        return True
+    return bool(EQUATION_ALT_TEXT_RE.match(sentence))
+
+
+def source_sentence_count(section: Section) -> int:
+    """Count the claims in a section's source, ignoring what is not a claim.
+
+    Fragments of three words or fewer are page furniture left by the PDF
+    conversion, and `conversion_artefact` catches the rest of that debris.
+    Counting any of it would understate the split ratio, and it concentrates
+    in exactly the formula-dense sections the ratio judges most harshly.
+    """
+    return sum(1 for paragraph in section.source_paragraphs
+               for sentence in split_sentences(paragraph)
+               if len(sentence.split()) > 3
+               and not conversion_artefact(sentence))
+
+
+def rewritten_sentence_count(section: Section) -> int:
+    """Count the sentences across a section's rewritten paragraphs."""
+    return sum(len(split_sentences(p)) for p in section.rewritten)
+
+
+def split_ratio(section: Section) -> Optional[float]:
+    """Return rewritten sentences per source claim, or None if unmeasurable.
+
+    None means the section offers no usable baseline, either because it holds
+    no countable source claims or because it holds too few for the ratio to
+    discriminate. Such a section is left alone rather than judged.
+    """
+    source_count = source_sentence_count(section)
+    if source_count < SPLIT_MIN_SOURCE_SENTENCES:
+        return None
+    return rewritten_sentence_count(section) / source_count
+
+
+def understretched_sections(doc: SourceDoc, floor: float) -> List[Section]:
+    """Return the sections whose split ratio falls below `floor`.
+
+    `floor` is the caller's, because the split stage casts a wider net than
+    the report does. A section whose ratio is unmeasurable is never returned.
+    """
+    out: List[Section] = []
+    for section in doc.sections:
+        if not section.rewritten:
+            continue
+        ratio = split_ratio(section)
+        if ratio is not None and ratio < floor:
+            out.append(section)
+    return out
+
+
+def numbers_in(text: str) -> List[str]:
+    """Return every numeric literal in a string, in order of appearance."""
+    return NUMBER_RE.findall(text)
+
+
+def normalise_markup(token: str) -> str:
+    """Reduce a markup token to the form worth comparing across a split.
+
+    Whitespace inside math mode does not render, and the source's spacing is
+    erratic, so it is dropped. Punctuation stranded inside the delimiters is
+    dropped too: moving a trailing comma out of '$pK_a ,$' fixes the span
+    rather than damaging it. What survives is the formula itself, so a real
+    corruption such as '\\times' becoming '\\\\times' still compares unequal.
+    """
+    if not token.startswith("$"):
+        return token
+    inner = "".join(token[1:-1].split())
+    return "$" + inner.strip(",.;:") + "$"
+
+
+def markup_in(text: str) -> List[str]:
+    """Return every LaTeX span and sup/sub tag in a string, normalised."""
+    return [normalise_markup(t) for t in MARKUP_RE.findall(text)]
+
+
+def mask_markup(text: str) -> Tuple[str, List[str]]:
+    """Replace every formula and sup/sub element with an opaque placeholder.
+
+    Returns the masked text and the spans taken out of it, ordered so that a
+    span's position in the list matches the number in its placeholder.
+    `unmask_markup` reverses this.
+    """
+    spans: List[str] = []
+
+    def take(match: "re.Match[str]") -> str:
+        """Record one span and yield the placeholder standing in for it."""
+        spans.append(match.group(0))
+        return PLACEHOLDER_TEMPLATE.format(len(spans))
+
+    return MASKABLE_RE.sub(take, text), spans
+
+
+def unmask_markup(text: str, spans: List[str]) -> str:
+    """Put the masked spans back where their placeholders now sit.
+
+    A placeholder numbered past the end of `spans` is left as it stands, so a
+    number the model invented surfaces as visibly unrestored text rather than
+    as a formula silently attached to the wrong claim.
+    """
+    def put(match: "re.Match[str]") -> str:
+        """Return the span a single placeholder stands for."""
+        index = int(match.group(1))
+        if 1 <= index <= len(spans):
+            return spans[index - 1]
+        return match.group(0)
+
+    return PLACEHOLDER_RE.sub(put, text)
+
+
+def placeholder_leaked(original: str, candidate: str) -> bool:
+    """Report whether a split result carries a placeholder that never restored.
+
+    A placeholder the model renumbered or pulled apart, such as '[FORMULA 1]',
+    does not match on the way back, and the bare word left behind is the
+    visible trace of it. The original is checked too, so a section that talks
+    about formulae in its own words is not mistaken for a damaged mask.
+    """
+    return "FORMULA" in candidate and "FORMULA" not in original
+
+
+def prompt_split(section: Section, paragraph: str) -> str:
+    """Build the prompt that splits one paragraph's packed sentences apart.
+
+    The heading goes in as context so the model can name a subject that the
+    paragraph itself refers to only by role. `paragraph` is expected to have
+    been through `mask_markup` already, since the prompt tells the model what
+    the placeholders mean.
+    """
+    return (
+        "Below is a paragraph of statements from a medical textbook, already "
+        "rewritten once for a knowledge graph. Some of its sentences still "
+        "carry more than one claim. A knowledge graph stores one relation per "
+        "statement, so a sentence asserting two things has to become two "
+        "sentences.\n\n"
+        f"HEADING: {section.heading}\n\n"
+        f"PARAGRAPH:\n{paragraph}\n\n"
+        "Split every sentence that makes more than one assertion into one "
+        "sentence per assertion. 'Collagen contains glycine at every third "
+        "residue, and this spacing lets the three chains pack tightly.' "
+        "becomes 'Collagen contains glycine at every third residue.' and "
+        "'The glycine spacing in collagen lets the three chains pack "
+        "tightly.'\n\n"
+        "Give every sentence you produce its own subject, named in full. Do "
+        "not start a sentence with 'this', 'these', 'it' or 'they'; repeat "
+        "the name instead, however long it is.\n\n"
+        "A list of items sharing one predicate is a single claim and stays "
+        "one sentence: 'Vitamin C deficiency causes bleeding gums, swelling "
+        "joints, and poor wound healing.' is already correct. Split on "
+        "assertions, not on commas.\n\n"
+        "Add nothing. Every claim in your answer must be in the paragraph "
+        "above, and every claim in the paragraph must be in your answer. "
+        "Keep each number, unit, range, condition, and each figure or table "
+        "mention such as '(Figure 2-1)' exactly as written, attached to the "
+        "claim it belongs to. Leave a sentence that already makes exactly "
+        "one claim exactly as it is, character for character.\n\n"
+        "Placeholders such as [FORMULA1] stand for chemical formulae that "
+        "have been taken out of the paragraph. Copy each one across exactly "
+        "as written, its number included, attached to the claim it belongs "
+        "to. Do not write out what a placeholder might stand for, do not "
+        "renumber one, and do not put spaces inside its brackets. A "
+        "placeholder may be the subject of a sentence, and it counts as a "
+        "term, so a claim about [FORMULA1] names [FORMULA1].\n\n"
+        "Answer with JSON of the form {\"sentences\": [\"...\", \"...\"]}, "
+        "holding the whole paragraph in its original order."
+    )
+
+
+def split_claims(client: LLMClient, doc: SourceDoc, workers: int) -> None:
+    """Split multi-claim sentences apart, in place, across weak sections.
+
+    Only paragraphs in sections below `SPLIT_TRIGGER_RATIO` are sent, so the
+    cost tracks the number of weakly split sections rather than the chapter.
+    That threshold is looser than the one `verify` reports against, so a
+    section is attempted before it is bad enough to be worth reporting.
+    Formulae are masked behind placeholders for the call and restored after it.
+    A paragraph is left as it was when the call fails, when the result loses
+    sentences, numbers or formula markup, when a placeholder fails to restore,
+    or when its word count expands past the padding ceiling.
+    """
+    todo: List[Tuple[Section, int]] = []
+    for section in understretched_sections(doc, SPLIT_TRIGGER_RATIO):
+        for index in range(len(section.rewritten)):
+            todo.append((section, index))
+    if not todo:
+        return
+
+    def one(item: Tuple[Section, int]) -> None:
+        """Split one paragraph, keeping the original on any failure."""
+        section, index = item
+        original = section.rewritten[index]
+        masked, spans = mask_markup(original)
+        tag = f"split:{section.sid}#{index}"
+        try:
+            raw = client.chat(SYS_REWRITER, prompt_split(section, masked),
+                              max_tokens=MAXTOK_SPLIT,
+                              temperature=TEMP_SPLIT,
+                              tag=tag)
+        except LLMError as exc:                           # noqa: BLE001
+            log(f"split failed for {tag}: {exc}")
+            return
+        sentences = _parse_paragraphs(raw, "sentences", tag)
+        if not sentences:
+            return
+        before = len(split_sentences(original))
+        if len(sentences) < before:
+            log(f"{tag}: split returned fewer sentences; keeping original")
+            return
+        candidate = unmask_markup(" ".join(sentences), spans)
+        if placeholder_leaked(original, candidate):
+            log(f"{tag}: split damaged a formula placeholder; "
+                "keeping original")
+            return
+        original_words = len(original.split())
+        if len(candidate.split()) > original_words * SPLIT_WORD_CEILING:
+            log(f"{tag}: split expanded {original_words} words to "
+                f"{len(candidate.split())}; keeping original")
+            return
+        # Splitting moves numbers between sentences but must never lose one, so
+        # a dropped literal is the cheapest reliable sign the claims drifted.
+        missing = _missing_numbers(original, candidate)
+        if missing:
+            log(f"{tag}: split dropped {', '.join(missing)}; keeping original")
+            return
+        unwrapped = _missing_markup(original, candidate)
+        if unwrapped:
+            extra = (f" and {len(unwrapped) - 1} more"
+                     if len(unwrapped) > 1 else "")
+            log(f"{tag}: split dropped markup {unwrapped[0]}{extra}; "
+                "keeping original")
+            return
+        section.rewritten[index] = candidate
+
+    _run_parallel(one, todo, workers, "claim splitting")
+
+
+def _missing_tokens(original: str, candidate: str, extract) -> List[str]:
+    """Return the tokens `extract` finds in `original` that `candidate` lost.
+
+    Counts occurrences, so a token dropped from one of two sentences is still
+    reported even when another sentence still carries it.
+    """
+    remaining = list(extract(candidate))
+    missing: List[str] = []
+    for token in extract(original):
+        if token in remaining:
+            remaining.remove(token)
+        else:
+            missing.append(token)
+    return missing
+
+
+def _missing_numbers(original: str, candidate: str) -> List[str]:
+    """Return the numeric literals of `original` that `candidate` lost."""
+    return _missing_tokens(original, candidate, numbers_in)
+
+
+def _missing_markup(original: str, candidate: str) -> List[str]:
+    """Return the LaTeX spans and sup/sub tags that `candidate` lost."""
+    return _missing_tokens(original, candidate, markup_in)
+
+
+# --------------------------------------------------------------------------
+# Stage 6: back-reference repair
+# --------------------------------------------------------------------------
+
+# A sentence opening with one of these needs its neighbour to say what it is
+# about, which is exactly what a triple extractor cannot do. The rewrite
+# rules forbid them and the model writes them anyway, so they are found here
+# by inspection and sent back one paragraph at a time.
+BACKREF_RE = re.compile(
+    r"^(?:This|That|These|Those|Such|They|Them|Their|Theirs|It|Its"
+    r"|He|Him|His|She|Her|Hers)\b")
+
+
+def split_sentences(text: str) -> List[str]:
+    """Split a paragraph into sentences on terminal punctuation."""
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def backreferences(paragraph: str) -> List[str]:
+    """Return the paragraph's sentences that open with a back-reference."""
+    return [s for s in split_sentences(paragraph) if BACKREF_RE.match(s)]
+
+
+def prompt_repair(section: Section, paragraph: str,
+                  offenders: List[str]) -> str:
+    """Build the prompt that names the subject of one paragraph's back-
+    references.
+
+    The whole section rewrite goes in as context, because the name a
+    back-reference stands for often sits in an earlier paragraph.
+    """
+    listed = "\n".join(f"  - {s}" for s in offenders)
+    context = "\n\n".join(section.rewritten)
+    return (
+        "Below is a passage of standalone statements from a medical "
+        "textbook, and one paragraph taken from it. Some sentences in that "
+        "paragraph begin with a back-reference, meaning a word that only "
+        "says which thing it is about if you have read the sentence "
+        "before it. Every sentence has to stand on its own.\n\n"
+        f"HEADING: {section.heading}\n\n"
+        f"WHOLE PASSAGE, for working out what each back-reference names:\n"
+        f"{context}\n\n"
+        f"PARAGRAPH TO REPAIR:\n{paragraph}\n\n"
+        "SENTENCES THAT BEGIN WITH A BACK-REFERENCE:\n"
+        f"{listed}\n\n"
+        "Rewrite only the sentences listed above. In each one, replace the "
+        "opening back-reference with the name of the thing it refers to, "
+        "taken from the passage. 'This condition prevents the kidneys from "
+        "concentrating urine.' becomes 'Nephrogenic diabetes insipidus "
+        "prevents the kidneys from concentrating urine.' if that is what "
+        "the passage says the condition is.\n\n"
+        "Leave every other sentence exactly as it is, character for "
+        "character. Do not add a claim, drop a claim, merge sentences or "
+        "split them. Keep every number, unit, piece of markup, and every "
+        "figure or table mention such as '(Figure 2-1)' exactly as "
+        "written. If the passage does not say what a back-reference names, "
+        "leave that sentence unchanged rather than guess.\n\n"
+        "Answer with JSON of the form {\"sentences\": [\"...\", \"...\"]}, "
+        "holding every sentence of the paragraph in its original order, "
+        "repaired ones and untouched ones alike."
+    )
+
+
+def repair_backreferences(client: LLMClient, doc: SourceDoc,
+                          workers: int) -> None:
+    """Replace sentence-initial back-references with the names they stand
+    for, in place.
+
+    Only paragraphs that fail the BACKREF_RE check are sent, so the cost is
+    proportional to the damage rather than to the chapter. A paragraph whose
+    repair fails, comes back empty, or comes back having lost sentences is
+    left as it was.
+    """
+    todo: List[Tuple[Section, int, List[str]]] = []
+    for section in doc.sections:
+        for index, paragraph in enumerate(section.rewritten):
+            offenders = backreferences(paragraph)
+            if offenders:
+                todo.append((section, index, offenders))
+    if not todo:
+        return
+
+    def one(item: Tuple[Section, int, List[str]]) -> None:
+        """Repair one paragraph, keeping the original on any failure."""
+        section, index, offenders = item
+        original = section.rewritten[index]
+        tag = f"repair:{section.sid}#{index}"
+        try:
+            raw = client.chat(SYS_REWRITER,
+                              prompt_repair(section, original, offenders),
+                              max_tokens=MAXTOK_REPAIR,
+                              temperature=TEMP_REPAIR,
+                              tag=tag)
+        except LLMError as exc:                           # noqa: BLE001
+            log(f"repair failed for {tag}: {exc}")
+            return
+        sentences = _parse_paragraphs(raw, "sentences", tag)
+        # A short return means the model dropped claims instead of naming
+        # subjects, which loses more than the back-references cost.
+        if len(sentences) < len(split_sentences(original)):
+            log(f"{tag}: repair returned fewer sentences; keeping original")
+            return
+        section.rewritten[index] = " ".join(sentences)
+
+    _run_parallel(one, todo, workers, "back-reference repair")
+
+
+# --------------------------------------------------------------------------
+# Stage 7: coverage audit
+# --------------------------------------------------------------------------
+
+SYS_AUDITOR = (
+    "You check a rewritten passage against its source for lost information. "
+    "You are strict and literal: you report only information the source "
+    "states and the rewrite does not. You answer with a single JSON object "
+    "and nothing else."
+)
+
+
+def prompt_audit(section: Section) -> str:
+    """Build the prompt comparing one section's rewrite against its source."""
+    return (
+        "SOURCE PASSAGE:\n" + "\n\n".join(section.source_paragraphs) + "\n\n"
+        "REWRITE:\n" + "\n\n".join(section.rewritten) + "\n\n"
+        "The rewrite was supposed to carry every piece of information in the "
+        "source passage. List the pieces it dropped. A piece counts as "
+        "dropped only if the source states it and the rewrite states neither "
+        "it nor an equivalent. Wording is allowed to differ; sentence order "
+        "and paragraph grouping are allowed to differ; a fact split across "
+        "several rewritten sentences is not dropped. Ignore transitions and "
+        "rhetorical framing, which the rewrite was told to remove.\n\n"
+        "Report each dropped piece as one short sentence naming the missing "
+        "information. If nothing was dropped, answer with an empty list. "
+        'Answer with JSON of the form {"missing": ["...", "..."]}.'
+    )
+
+
+def audit_sections(client: LLMClient, doc: SourceDoc,
+                   workers: int) -> Dict[str, List[str]]:
+    """Report, per section id, the information the rewrite dropped.
+
+    A section whose audit call fails is logged and reported as unaudited
+    rather than passed, so a backend wobble cannot read as a clean bill.
+    """
+    todo = [s for s in doc.sections if s.source_paragraphs and s.rewritten]
+    findings: Dict[str, List[str]] = {}
+    if not todo:
+        return findings
+
+    def one(section: Section) -> None:
+        """Audit a single section."""
+        try:
+            raw = client.chat(SYS_AUDITOR, prompt_audit(section),
+                              max_tokens=MAXTOK_AUDIT, temperature=TEMP_AUDIT,
+                              tag=f"audit:{section.sid}")
+        except LLMError as exc:                           # noqa: BLE001
+            findings[section.sid] = [f"audit did not run: {exc}"]
+            return
+        missing = _parse_paragraphs(raw, "missing", f"audit:{section.sid}")
+        if missing:
+            findings[section.sid] = missing
+
+    _run_parallel(one, todo, workers, "audit")
+    return findings
+
+
+# --------------------------------------------------------------------------
+# Stage 8: cross-reference linking
 # --------------------------------------------------------------------------
 
 MENTION_RE = re.compile(
@@ -1301,7 +2258,7 @@ def reference_index(doc: SourceDoc) -> Dict[str, str]:
 
 
 # --------------------------------------------------------------------------
-# Stage 5: rendering
+# Stage 9: rendering
 # --------------------------------------------------------------------------
 
 def _caption(text: str, known: Dict[str, str]) -> str:
@@ -1320,8 +2277,17 @@ def render_figure(fig: Figure, known: Dict[str, str]) -> str:
         attrs += f' src="{escape_attr(fig.image_src)}"'
     out = [f"<fig {attrs}>"]
     out.append(f"<cap>{_caption(fig.caption, known)}</cap>")
-    out.append("<desc></desc>")
-    if fig.extra:
+
+    if fig.diagram_prose:
+        out.append("<desc>")
+        out.extend(link_references(s, known) for s in fig.diagram_prose)
+        out.append("</desc>")
+    else:
+        out.append("<desc></desc>")
+
+    # A converted extra now lives in <desc>. One that failed to convert goes
+    # out as it came, so a backend failure loses nothing but the shaping.
+    if fig.extra and not fig.diagram_prose:
         out.append("")
         out.append(fig.extra)
     out.append("</fig>")
@@ -1329,32 +2295,101 @@ def render_figure(fig: Figure, known: Dict[str, str]) -> str:
 
 
 def render_table(tbl: Table, known: Dict[str, str]) -> str:
-    """Render one <tbl>. ``known`` links cross-references inside the caption."""
+    """Render one <tbl>. ``known`` links cross-references inside the caption.
+
+    The body is the prose the grid became. The source <table> markup is not
+    emitted, because the whole point of the conversion is that a triple
+    extractor cannot read it.
+    """
     attrs = f'id="{escape_attr(tbl.tid)}"'
     if tbl.label:
         attrs += f' label="{escape_attr(tbl.label)}"'
     out = [f"<tbl {attrs}>"]
     out.append(f"<cap>{_caption(tbl.caption, known)}</cap>")
-    if tbl.body:
-        out.append(tbl.body)
+    if tbl.prose:
+        out.append("<con>")
+        out.extend(link_references(s, known) for s in tbl.prose)
+        out.append("</con>")
     out.append("</tbl>")
     return "\n".join(out)
 
 
-def render_section(section: Section, known: Dict[str, str]) -> str:
-    """Render one <sec>, walking its elements in source order."""
-    out = [f'<sec id="{escape_attr(section.sid)}" level="{section.level}">',
-           f"<head>{clean_heading(section.heading)}</head>", ""]
+def anchor_blocks(section: Section,
+                  paragraphs: Sequence[str]) -> Dict[int, List[Element]]:
+    """Decide which rewritten paragraph each figure and table follows.
+
+    Returns a map from paragraph index to the elements emitted after it. Key
+    -1 is the trailing bucket, used when a section has no paragraphs to
+    anchor to.
+
+    A block the prose references is placed after the paragraph that first
+    references it, which is what keeps a figure next to the claim it
+    illustrates once the rewrite has re-chunked the section. A block nothing
+    references -- an unnumbered inline diagram has no mention string, so this
+    is its normal case -- keeps its source position proportionally, so it
+    still lands among the paragraphs it sat between.
+    """
+    anchors: Dict[int, List[Element]] = {}
+    if not paragraphs:
+        anchors[-1] = [e for e in section.elements if e.kind != "para"]
+        return anchors
+
+    seen_paras = 0
+    total_paras = len(section.source_paragraphs)
     for element in section.elements:
         if element.kind == "para":
-            out.append("<con>")
-            out.append(link_references(element.text, known))
-            out.append("</con>")
-        elif element.kind == "figure" and element.figure is not None:
+            seen_paras += 1
+            continue
+
+        if element.kind == "figure" and element.figure is not None:
+            ref_id = element.figure.fid
+        elif element.kind == "table" and element.table is not None:
+            ref_id = element.table.tid
+        else:
+            ref_id = ""
+
+        target: Optional[int] = None
+        if ref_id:
+            needle = f'id="{escape_attr(ref_id)}"'
+            target = next((i for i, p in enumerate(paragraphs) if needle in p),
+                          None)
+        if target is None:
+            # Same fraction of the way through the rewrite as through the
+            # source, minus one because the block follows that paragraph.
+            share = seen_paras / total_paras if total_paras else 1.0
+            target = min(len(paragraphs) - 1,
+                         max(0, int(round(share * len(paragraphs))) - 1))
+        anchors.setdefault(target, []).append(element)
+    return anchors
+
+
+def render_section(section: Section, known: Dict[str, str]) -> str:
+    """Render one <sec> from its rewritten paragraphs, with blocks anchored."""
+    out = [f'<sec id="{escape_attr(section.sid)}" level="{section.level}">',
+           f"<head>{clean_heading(section.heading)}</head>", ""]
+
+    paragraphs = [link_references(p, known) for p in section.rewritten]
+    anchors = anchor_blocks(section, paragraphs)
+
+    def emit(element: Element) -> None:
+        """Append one figure or table block."""
+        if element.kind == "figure" and element.figure is not None:
             out.append(render_figure(element.figure, known))
         elif element.kind == "table" and element.table is not None:
             out.append(render_table(element.table, known))
         out.append("")
+
+    for index, paragraph in enumerate(paragraphs):
+        out.append("<con>")
+        out.append(paragraph)
+        out.append("</con>")
+        out.append("")
+        for element in anchors.get(index, ()):
+            emit(element)
+
+    for element in anchors.get(-1, ()):
+        emit(element)
+
     out.append("</sec>")
     return "\n".join(out)
 
@@ -1428,27 +2463,28 @@ SILENT_DISPOSITIONS = {
     "book",           # recorded in <src>
     "author",         # attribution already carried by the book line
     "credit",         # repeated per-figure copyright boilerplate
-    "figure-alt",     # would populate <desc>, which is empty for now
-    "figure-head", "figure-image", "figure-detail",
-    "table-head", "table-body",
+    "figure-alt",     # describes the image file, not the chapter's subject
+    "figure-head", "figure-image",
+    "figure-detail",  # a mermaid diagram here reaches <desc> as prose
+    "table-head",
+    "table-body",     # reaches <tbl> as prose, not as markup
 }
 
 EMITTED_DISPOSITIONS = {
     "content", "caption", "objectives", "summary", "glossary", "references",
 }
 
-_TAG_RE = re.compile(r"</?[a-z][a-z0-9]*(?:\s[^>]*)?/?>", re.I)
 
+def verify(output: str, doc: SourceDoc,
+           audit: Optional[Dict[str, List[str]]] = None) -> List[str]:
+    """Check the document's structure and report what the audit found.
 
-def _plain(text: str) -> str:
-    """Text with tags removed and whitespace collapsed, for comparison."""
-    return re.sub(r"\s+", " ", _TAG_RE.sub("", text)).strip()
-
-
-def verify(output: str, doc: SourceDoc) -> List[str]:
-    """Check that nothing was lost and that every reference resolves."""
+    Content preservation is no longer checkable here. The body is rewritten,
+    so a source paragraph has no verbatim counterpart to look for; ``audit``
+    carries the per-section coverage findings that replaced that check, and
+    is None when --no-audit skipped the pass.
+    """
     problems: List[str] = []
-    flat = _plain(output)
 
     known_dispositions = SILENT_DISPOSITIONS | EMITTED_DISPOSITIONS
     for block in doc.blocks:
@@ -1456,16 +2492,36 @@ def verify(output: str, doc: SourceDoc) -> List[str]:
             problems.append(f"UNACCOUNTED source block ({block.disposition}): "
                             f"{block.text[:100]!r}")
 
-    missing = 0
-    for block in doc.blocks:
-        if block.disposition != "content":
-            continue
-        if _plain(block.text) not in flat:
-            missing += 1
-            if missing <= 5:
-                problems.append(f"CONTENT LOST: {block.text[:100]!r}")
-    if missing > 5:
-        problems.append(f"CONTENT LOST: and {missing - 5} more paragraph(s)")
+    for section in doc.sections:
+        if section.source_paragraphs and not section.rewritten:
+            problems.append(f"section {section.sid} has "
+                            f"{len(section.source_paragraphs)} source "
+                            "paragraph(s) but no rewrite")
+
+    for tbl in doc.tables:
+        if tbl.body and not tbl.prose:
+            problems.append(f"table {tbl.tid} was not converted to prose")
+    for fig in doc.figures:
+        kind = figure_extra_kind(fig.extra)
+        if kind and not fig.diagram_prose:
+            problems.append(f"{kind} attached to {fig.fid} was not "
+                            "converted to prose")
+
+    for section in doc.sections:
+        for paragraph in section.rewritten:
+            for sentence in backreferences(paragraph):
+                problems.append(f"BACK-REFERENCE ({section.sid}): "
+                                f"{sentence}")
+
+    for section in understretched_sections(doc, SPLIT_RATIO_FLOOR):
+        problems.append(
+            f"UNSPLIT ({section.sid}): {source_sentence_count(section)} "
+            f"source sentences became {rewritten_sentence_count(section)}, "
+            f"a ratio of {split_ratio(section):.2f}")
+
+    for section_id, missing in sorted((audit or {}).items()):
+        for item in missing:
+            problems.append(f"INFORMATION LOST ({section_id}): {item}")
 
     for fig in doc.figures:
         n = output.count(f'<fig id="{fig.fid}"')
@@ -1481,7 +2537,7 @@ def verify(output: str, doc: SourceDoc) -> List[str]:
         if ref_id not in known:
             problems.append(f"dangling reference: {ref_id}")
 
-    for tag in ("doc", "meta", "obj", "sum", "def", "ref"):
+    for tag in ("doc", "meta", "obj", "sum", "def", "ref", "con", "desc"):
         if f"<{tag}>" in output and output.count(f"<{tag}>") != output.count(f"</{tag}>"):
             problems.append(f"unbalanced <{tag}> tags")
     for tag in ("sec", "fig", "tbl"):
@@ -1507,46 +2563,58 @@ def run(args: argparse.Namespace) -> int:
     """Convert one file end to end.
 
     Writes to args.output, or stdout when it is '-'. Returns 3 if the backend
-    is unreachable, 2 if the input yielded no content, 1 if verification
-    raised warnings, and 0 otherwise.
+    is unreachable or the rewrite came back unusable, 2 if the input yielded
+    no content, 1 if verification raised warnings, and 0 otherwise.
     """
     doc = parse_source(args.input)
     if not doc.sections:
         sys.stderr.write(f"error: no content found in {args.input}\n")
         return 2
 
-    offline = args.offline or args.dry_run
-    if offline:
-        client: LLMClient = OfflineClient(doc)
-        model = "offline"
-    else:
-        client = LLMClient(
-            base_url=args.base_url, model=args.model, timeout=args.timeout,
-            retries=args.retries, cache_dir=args.cache_dir,
-            debug_dir=args.debug_dir,
-        )
-        model = args.model
-
+    client = LLMClient(
+        base_url=args.base_url, model=args.model, timeout=args.timeout,
+        retries=args.retries, cache_dir=args.cache_dir,
+        debug_dir=args.debug_dir,
+    )
     want_summary = not args.no_summary
 
-    log("stage 1/3  metadata")
+    # Every stage that calls the model refuses rather than degrades. A
+    # document that is half rewritten and half missing would pass into the
+    # knowledge graph looking like a complete one.
     try:
+        log("stage 1/7  metadata")
         topic = build_metadata(client, doc, want_summary)
+
+        log("stage 2/7  captions")
+        fill_missing_captions(client, doc, args.workers)
+
+        log(f"stage 3/7  rewrite ({len(doc.sections)} sections, "
+            f"{len(doc.tables)} tables)")
+        rewrite_sections(client, doc, args.workers)
+        rewrite_tables(client, doc, args.workers)
+        rewrite_diagrams(client, doc, args.workers)
+
+        log("stage 4/7  claim splitting")
+        split_claims(client, doc, args.workers)
+
+        log("stage 5/7  back-reference repair")
+        repair_backreferences(client, doc, args.workers)
+
+        audit: Optional[Dict[str, List[str]]] = None
+        if args.no_audit:
+            log("stage 6/7  audit skipped (--no-audit)")
+        else:
+            log("stage 6/7  audit")
+            audit = audit_sections(client, doc, args.workers)
     except LLMError as exc:                               # noqa: BLE001
-        # Refusing here rather than falling back keeps a misconfigured backend
-        # from quietly producing a document with degraded metadata.
         sys.stderr.write(f"error: {exc}\n")
-        sys.stderr.write("hint: rerun with --offline to build the document "
-                         "without the backend\n")
+        sys.stderr.write(f"hint: check the backend at {args.base_url}\n")
         return 3
 
-    log("stage 2/3  captions")
-    fill_missing_captions(client, doc, args.workers)
+    log("stage 7/7  render")
+    output = render_document(doc, topic, args.model, want_summary)
 
-    log("stage 3/3  render")
-    output = render_document(doc, topic, model, want_summary)
-
-    problems = verify(output, doc)
+    problems = verify(output, doc, audit)
     log("blocks: " + disposition_report(doc))
     for problem in problems:
         sys.stderr.write(f"warning: {problem}\n")
@@ -1560,7 +2628,8 @@ def run(args: argparse.Namespace) -> int:
             fh.write(output)
         print(f"wrote {args.output}  "
               f"({len(doc.sections)} sections, {len(doc.figures)} figures, "
-              f"{len(doc.tables)} tables, {doc.content_words} content words, "
+              f"{len(doc.tables)} tables, {doc.content_words} source words "
+              f"-> {doc.rewritten_words} rewritten, "
               f"{len(problems)} warning(s))")
 
     return 1 if problems else 0
@@ -1581,15 +2650,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
     p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                   help="parallel LLM calls when captions have to be inferred")
+                   help="parallel LLM calls; the rewrite fans out over these")
     p.add_argument("--cache-dir", default=None,
                    help="cache LLM responses here so reruns are cheap")
     p.add_argument("--debug-dir", default=None,
                    help="write every raw prompt+completion here for diagnosis")
     p.add_argument("--offline", action="store_true",
-                   help="never call the model; derive <topic> from the title")
+                   help="no longer supported; the body needs the model")
     p.add_argument("--dry-run", action="store_true",
                    help="alias for --offline")
+    p.add_argument("--no-audit", action="store_true",
+                   help="skip the coverage audit, roughly halving the calls")
     p.add_argument("--no-summary", action="store_true",
                    help="omit the <sum> block")
     p.add_argument("--print-schema", action="store_true",
@@ -1607,6 +2678,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.print_schema:
         print_schema()
         return 0
+    if args.offline or args.dry_run:
+        # Kept as a flag rather than dropped so the failure explains itself,
+        # instead of arriving as an argparse error from a batch script.
+        sys.stderr.write(
+            "error: --offline is not supported. Every section, table and "
+            "diagram is rewritten by the model, so there is no document to "
+            "build without a backend.\n")
+        return 2
     if not args.input:
         build_parser().error("input file is required (or use --print-schema)")
     if not os.path.exists(args.input):

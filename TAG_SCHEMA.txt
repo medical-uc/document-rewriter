@@ -5,8 +5,8 @@ TAG      PARENT     MEANING
 <doc>    root       Wraps the entire generated document.
 <meta>   doc        Document-level metadata block.
 <title>  meta       Chapter title. Plain text, no '#' marker.
-<topic>  meta       One-line statement of the subject matter. The only element
-                    inferred rather than carried over.
+<topic>  meta       One-line statement of the subject matter, inferred from
+                    the chapter.
 <src>    meta       Provenance: source filename, book, figure and table
                     counts, model, timestamp.
 <obj>    doc        Learning objectives, from the chapter's OBJECTIVES list.
@@ -14,25 +14,25 @@ TAG      PARENT     MEANING
 <sec>    doc        One section. Attributes: id, level. Sections are flat;
                     depth is carried by the level attribute.
 <head>   sec        Section heading, verbatim from the source.
-<con>    sec        A content paragraph carried over from the source. Only
-                    three things are changed: extraction artefacts are
-                    repaired, page-break splits are rejoined, and in-document
-                    figure and table mentions are wrapped in
-                    <figref>/<tblref>.
-<fig>    sec        A figure, emitted at the position it occupied in the
-                    source. Attributes: id; label when the source numbered it;
-                    src when it carried an image file; panel for the 'A'/'B'
-                    letter on an unnumbered inline diagram.
+<con>    sec / tbl  Rewritten content. Under <sec>, one claim cluster from the
+                    section's rewrite; the grouping is the rewriter's, not the
+                    source's paragraph breaks. Under <tbl>, the sentences the
+                    table's grid became.
+<fig>    sec        A figure. Attributes: id; label when the source numbered
+                    it; src when it carried an image file; panel for the
+                    'A'/'B' letter on an unnumbered inline diagram. Emitted
+                    after the <con> that first references it.
 <cap>    fig / tbl  Caption, taken from the source text.
-<desc>   fig        Figure description. Emitted empty and reserved: nothing in
-                    a textbook chapter describes the image itself.
+<desc>   fig        The figure's own content in words. Holds the sentences a
+                    mermaid diagram or an attached data table became, and is
+                    empty for a figure that is only an image.
 <figref> con        A reference to a <fig> in this document. Attribute: id.
-                    Wraps the original mention text, so the prose reads
-                    unchanged with the tags removed.
-<tbl>    sec        A table, emitted at its source position. Attributes: id,
-                    label. Holds <cap> and the source table markup.
+                    Wraps the mention text.
+<tbl>    sec        A table. Attributes: id, label. Holds <cap> and a <con> of
+                    prose; the source grid markup is not emitted. Emitted
+                    after the <con> that first references it.
 <tblref> con        A reference to a <tbl> in this document. Attribute: id.
-                    Wraps the original mention text.
+                    Wraps the mention text.
 <sum>    doc        Chapter summary, from the source SUMMARY section.
 <def>    doc        Glossary, from the source GLOSSARY section.
 <term>   def        One definition, phrased as a complete sentence that begins
@@ -40,17 +40,46 @@ TAG      PARENT     MEANING
 <ref>    doc        Reference list, from the source RECOMMENDED READING.
 <cit>    ref        A single citation.
 
-FAITHFULNESS
+WHAT THE BODY IS
 
-The chapter is a finished text, so <con> is carried over, not rewritten.
-Every content paragraph in the source reaches exactly one <con>, and the
-tool warns loudly rather than silently dropping one. The only edits applied
-to carried-over text are mechanical repairs to PDF extraction damage:
+The body is rewritten, not carried over. Each section is read whole, the
+information in it is inventoried, and the section is restated as prose aimed
+at triple extraction:
 
-  * U+00A0 word separators become ordinary spaces;
-  * U+00AD, which the extractor emits in place of a real hyphen, becomes
-    an ASCII '-';
-  * paragraphs split mid-sentence at a page break are rejoined.
+  * one claim per sentence, shaped subject-predicate-object. Splitting a
+    source's packed sentences apart should leave a section with more
+    sentences than it started with, so a section that came back with too
+    few is sent back to be split, and is reported by verify if it still
+    reads short;
+  * every sentence names its own subject, so no sentence depends on its
+    neighbour to say what it is about. A sentence that still opens with a
+    back-reference after the rewrite is sent back to have the name filled
+    in, and is reported by verify if it survives that;
+  * the source's own terms, spellings, numbers, units and conditions;
+  * coordination that hides a relation is split into separate sentences;
+  * transitions and rhetorical framing are dropped;
+  * nothing is added, inferred or generalised.
+
+Paragraph grouping is the rewriter's, so a <con> does not correspond to a
+source paragraph. A section's <con> count is unrelated to its source's.
+
+Tables and mermaid diagrams hold information that is not in sentences at
+all, so they are restated too: a table's grid becomes a <con> of sentences
+inside its <tbl>, each naming its row and its column so it stands alone, and
+a mermaid diagram becomes one sentence per arrow inside the figure's <desc>.
+A data table the extractor attached to a figure rather than to a <tbl> is
+restated the same way, into that figure's <desc>. Neither grid markup nor
+mermaid source is emitted, unless a conversion failed, in which case the
+block goes out as it came and verify reports it.
+
+COVERAGE
+
+Because the body is rewritten, there is no verbatim text to check the output
+against. Coverage is checked instead by a second pass that reads each
+section's source against its rewrite and reports information the rewrite
+dropped. Findings are warnings on stderr and a non-zero exit, and --no-audit
+skips the pass. This is a weaker guarantee than the containment check it
+replaced, and it is the price of rewriting.
 
 MARKDOWN SYNTAX POLICY
 
@@ -61,12 +90,10 @@ emitted:
     Heading depth is expressed by the level attribute on <sec>.
   * List items are elements (<goal>, <term>, <cit>), not '- ' bullets.
 
-Content-level markup inside <con>, <cap> and <tbl> is preserved exactly as
-the source had it. That includes inline emphasis, <sup> and <sub>, LaTeX
-spans such as $\mathsf{pK_a}$, the HTML <table> blobs the extractor
-produces, and any mermaid diagram carried inside a <fig>. Nothing in
-element content is entity-escaped, because escaping would corrupt that
-markup; only attribute values are escaped.
+Content-level markup is preserved: inline emphasis, <sup> and <sub>, and
+LaTeX spans such as $\mathsf{pK_a}$ survive the rewrite. Nothing in element
+content is entity-escaped, because escaping would corrupt that markup; only
+attribute values are escaped.
 
 CROSS-REFERENCES
 
@@ -74,9 +101,11 @@ A mention of a figure or table defined in this chapter is wrapped in place:
 
     ... clinical insights (<figref id="fig-1-1">Figure 1-1</figref>).
 
-Mentions that point outside the chapter, such as 'see Figure 40-5', are
-left as plain text, because there is nothing in this document to link to.
-Removing the tags restores the source sentence exactly.
+The rewriter is told to keep a pointer in the sentence carrying the
+information the figure illustrates, and the block itself is emitted after
+the <con> that first points at it. Mentions that point outside the chapter,
+such as 'see Figure 40-5', are left as plain text, because there is nothing
+in this document to link to.
 
 BLOCK SHAPES
 
@@ -87,6 +116,9 @@ BLOCK SHAPES
 
     <tbl id="tbl-2-1" label="Table 2-1">
     <cap>Bond Energies for Atoms of Biologic Significance</cap>
-    <table>...</table>
+    <con>
+    An O-O bond has a bond energy of 34 kcal/mol.
+    An S-S bond has a bond energy of 51 kcal/mol.
+    </con>
     </tbl>
 
